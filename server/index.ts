@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Router: any; sql: any; createLocalAgentJwt: (agentId: string, companyId: string, adapterType: string, runId: string) => string | null }) {
+export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Router: any; sql: any; createLocalAgentJwt: (agentId: string, companyId: string, adapterType: string, runId: string | null) => string | null }) {
   const router = Router();
+
+  // Track active Claude processes per thread for stop functionality
+  const activeProcesses = new Map<string, ReturnType<typeof spawn>>();
 
   function getRows(result: any): any[] {
     return Array.isArray(result) ? result : (result.rows ?? []);
@@ -84,6 +86,18 @@ export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Ro
       sql`UPDATE plugin_chat_ui_threads SET title = ${title}, updated_at = NOW() WHERE id = ${threadId} RETURNING *`,
     );
     res.json(getRows(result)[0] ?? null);
+  });
+
+  // Stop a running response
+  router.post("/threads/:threadId/stop", async (req: any, res: any) => {
+    const { threadId } = req.params;
+    const proc = activeProcesses.get(threadId);
+    if (proc && !proc.killed) {
+      proc.kill("SIGTERM");
+      res.json({ ok: true, stopped: true });
+    } else {
+      res.json({ ok: true, stopped: false });
+    }
   });
 
   // ---- Chat endpoint: spawn claude CLI, stream response via SSE ----
@@ -170,8 +184,6 @@ export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Ro
     // Build Paperclip env vars so Claude can interact with the Paperclip API
     const companyId = thread.company_id;
     const chatAgentId = `chat-ui-${companyId}`;
-    const chatRunId = randomUUID();
-
     const resolveHost = (raw: string): string => {
       const h = raw.trim();
       if (!h || h === "0.0.0.0" || h === "::") return "localhost";
@@ -185,11 +197,10 @@ export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Ro
       PAPERCLIP_AGENT_ID: chatAgentId,
       PAPERCLIP_COMPANY_ID: companyId,
       PAPERCLIP_API_URL: apiUrl,
-      PAPERCLIP_RUN_ID: chatRunId,
     };
 
     // Generate JWT if secret is configured
-    const jwt = createLocalAgentJwt(chatAgentId, companyId, "claude_local", chatRunId);
+    const jwt = createLocalAgentJwt(chatAgentId, companyId, "claude_local", null);
     if (jwt) {
       paperclipEnv.PAPERCLIP_API_KEY = jwt;
     }
@@ -199,6 +210,8 @@ export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Ro
       env: { ...process.env, ...paperclipEnv },
       stdio: ["pipe", "pipe", "pipe"],
     });
+
+    activeProcesses.set(threadId, proc);
 
     // Send prompt via stdin
     proc.stdin.write(message);
@@ -303,6 +316,7 @@ export default function ({ db, Router, sql, createLocalAgentJwt }: { db: any; Ro
     });
 
     proc.on("close", async (code: number | null) => {
+      activeProcesses.delete(threadId);
       // Process any remaining buffer
       if (stdoutBuffer.trim()) {
         try {

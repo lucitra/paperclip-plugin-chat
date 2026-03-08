@@ -19,6 +19,7 @@ import {
   Circle,
   Brain,
   ChevronUp,
+  Square,
 } from "lucide-react";
 
 const MODELS = [
@@ -928,6 +929,13 @@ export default function ChatPage() {
     [],
   );
 
+  const handleStop = useCallback(async () => {
+    if (!selectedThreadId) return;
+    try {
+      await fetch(`/api/plugins/chat-ui/threads/${selectedThreadId}/stop`, { method: "POST" });
+    } catch {}
+  }, [selectedThreadId]);
+
   const handleSend = useCallback(async () => {
     const trimmed = input.trim();
     if (!trimmed || !selectedThreadId || isStreaming) return;
@@ -1406,22 +1414,27 @@ export default function ChatPage() {
                       }
                     }}
                     placeholder={isStreaming ? "Waiting for response…" : "Ask Paperclip anything…"}
-                    disabled={isStreaming}
                     rows={1}
                     className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground/40 resize-none outline-none disabled:opacity-40 leading-[1.4] self-center"
                     style={{ maxHeight: 160 }}
                   />
-                  <button
-                    onClick={handleSend}
-                    disabled={!input.trim() || isStreaming}
-                    className="shrink-0 h-7 w-7 rounded flex items-center justify-center bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 transition-colors"
-                  >
-                    {isStreaming ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
+                  {isStreaming ? (
+                    <button
+                      onClick={handleStop}
+                      className="shrink-0 h-7 w-7 rounded flex items-center justify-center bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
+                      title="Stop response"
+                    >
+                      <Square className="h-3 w-3 fill-current" />
+                    </button>
+                  ) : (
+                    <button
+                      onClick={handleSend}
+                      disabled={!input.trim()}
+                      className="shrink-0 h-7 w-7 rounded flex items-center justify-center bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 transition-colors"
+                    >
                       <Send className="h-3.5 w-3.5" />
-                    )}
-                  </button>
+                    </button>
+                  )}
                 </div>
                 <div className="flex items-center justify-between mt-1.5 px-0.5">
                   {/* Model switcher */}
