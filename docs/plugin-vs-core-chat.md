@@ -163,11 +163,11 @@ Plugin pages route to `/:companyPrefix/plugins/:pluginId` (UUID). There is no su
 - Users can't share links to specific conversations
 - Browser back/forward doesn't work within the plugin
 
-### 7. Streaming Bridge Not Wired
+### 7. ~~Streaming Bridge Not Wired~~ (Resolved)
 
-The SSE backend is fully implemented (`ctx.streams.open/emit/close`, stream bus, SSE endpoint). The `usePluginStream()` hook is declared in the SDK and registered in `bridge-init.ts`, but has **no concrete implementation** in `bridge.ts`. This is ~60 lines of code to fix.
+**Fixed in PR #432.** The `usePluginStream()` hook now has a full `EventSource`-based implementation in `bridge.ts`. The SSE pipeline is end-to-end: worker calls `ctx.streams.emit(channel, event)` → stream bus → SSE endpoint (`/api/plugins/:pluginId/bridge/stream/:channel`) → `EventSource` in the browser → `usePluginStream()` returns accumulated events.
 
-**Impact today:** Chat plugin polls every 1.5s for new messages. Users see chunked text instead of token-by-token streaming.
+The chat plugin already integrates this — it subscribes to `chat:${threadId}` and processes `text`, `thinking`, `tool_use`, `error`, and `done` events in real time.
 
 ### 8. UUID-Only User Identity
 
@@ -215,7 +215,7 @@ These are the workarounds we implemented in the plugin to compensate for missing
 
 | Gap | Workaround | Cost |
 |-----|-----------|------|
-| No streaming | Poll `getData` every 1.5s, buffer chunks in worker state | Choppy UX, wasted requests |
+| ~~No streaming~~ | ~~Poll `getData` every 1.5s~~ → Now uses `usePluginStream()` SSE (fixed in PR #432) | Resolved |
 | No design system | ~400 lines of inline CSS with `var()` fallbacks | Fragile, doesn't match host exactly |
 | No markdown renderer | Bundle our own (basic regex-based) | Missing features vs host's `MarkdownBlock` |
 | No toast API | Silent failures, `console.error` only | Users don't know when things break |
@@ -234,7 +234,7 @@ These are the workarounds we implemented in the plugin to compensate for missing
 
 | Capability | Plugin Chat (Current) | Core Chat Page |
 |------------|----------------------|----------------|
-| Token streaming | 1.5s polling | Native SSE, token-by-token |
+| Token streaming | SSE via `usePluginStream()` (PR #432) | Native SSE, token-by-token |
 | LLM access | Agent sessions only (indirect) | Direct adapter API, model selection |
 | Process execution | None | Can spawn CLI tools directly |
 | Design system | Inline styles, CSS var hacks | Full component library, design tokens |
@@ -264,8 +264,8 @@ These are the workarounds we implemented in the plugin to compensate for missing
 
 Ordered by impact on the plugin's featureset:
 
-### Unblocks real-time streaming
-1. **Implement `usePluginStream()` in bridge.ts** — the SSE backend is complete, the frontend hook is missing. Without this, the plugin polls every 1.5s instead of streaming token-by-token.
+### ~~Unblocks real-time streaming~~ (Done)
+1. ~~**Implement `usePluginStream()` in bridge.ts**~~ — Completed in PR #432. The chat plugin now streams token-by-token via SSE.
 
 ### Unblocks native look-and-feel
 2. **Implement bridge UI components** — replace stubs with real `MarkdownBlock`, `Spinner`, `DataTable`. Without this, every plugin rebuilds basic UI from scratch with inline styles.
