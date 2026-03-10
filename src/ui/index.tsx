@@ -76,6 +76,71 @@ function IconChevron({ size = 10, color = "currentColor" }: { size?: number; col
 }
 
 // ---------------------------------------------------------------------------
+// Utility hooks — dark mode, mobile, available height
+// ---------------------------------------------------------------------------
+
+function useIsDarkMode(): boolean {
+  const [isDarkMode, setIsDarkMode] = useState(() =>
+    typeof document !== "undefined" && document.documentElement.classList.contains("dark"),
+  );
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    const update = () => setIsDarkMode(root.classList.contains("dark"));
+    update();
+    const observer = new MutationObserver(update);
+    observer.observe(root, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
+  return isDarkMode;
+}
+
+function useIsMobile(breakpointPx = 768): boolean {
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth < breakpointPx : false,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mediaQuery = window.matchMedia(`(max-width: ${breakpointPx - 1}px)`);
+    const update = () => setIsMobile(mediaQuery.matches);
+    update();
+    mediaQuery.addEventListener("change", update);
+    return () => mediaQuery.removeEventListener("change", update);
+  }, [breakpointPx]);
+  return isMobile;
+}
+
+function useAvailableHeight(
+  ref: React.RefObject<HTMLElement | null>,
+  options?: { bottomPadding?: number; minHeight?: number },
+): number | null {
+  const bottomPadding = options?.bottomPadding ?? 24;
+  const minHeight = options?.minHeight ?? 384;
+  const [height, setHeight] = useState<number | null>(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const update = () => {
+      const element = ref.current;
+      if (!element) return;
+      const rect = element.getBoundingClientRect();
+      const nextHeight = Math.max(minHeight, Math.floor(window.innerHeight - rect.top - bottomPadding));
+      setHeight(nextHeight);
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("orientationchange", update);
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => update()) : null;
+    if (observer && ref.current) observer.observe(ref.current);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("orientationchange", update);
+      observer?.disconnect();
+    };
+  }, [bottomPadding, minHeight, ref]);
+  return height;
+}
+
+// ---------------------------------------------------------------------------
 // Markdown link component — open links in new tab
 // ---------------------------------------------------------------------------
 
@@ -197,21 +262,6 @@ const CHAT_STYLES = `
     .chat-cursor::after { animation: none; }
     .chat-tool-pulse { animation: none; opacity: 1; }
   }
-  .chat-sidebar-thread:hover {
-    background: var(--accent, rgba(0, 0, 0, 0.04));
-  }
-  .chat-sidebar-thread.active {
-    background: var(--accent, rgba(0, 0, 0, 0.06));
-  }
-  .chat-action-chip:hover {
-    color: var(--foreground, #1e293b) !important;
-    border-color: var(--foreground, rgba(30,41,59,0.2)) !important;
-    background: var(--accent, #f1f5f9) !important;
-  }
-  .chat-recent-thread:hover {
-    background: var(--accent, #f1f5f9) !important;
-    border-color: var(--foreground, rgba(30,41,59,0.1)) !important;
-  }
 `;
 
 // ---------------------------------------------------------------------------
@@ -270,38 +320,17 @@ function summarizeTools(segments: ChatSegment[]): string {
 function ThinkingBlock({ content, isLive }: { content: string; isLive: boolean }) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="chat-msg-enter" style={{ margin: "6px 0" }}>
+    <div className="chat-msg-enter my-1.5">
       <button
         onClick={() => setExpanded(!expanded)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          fontSize: 12,
-          color: "var(--muted-foreground, #94a3b8)",
-          background: "none",
-          border: "none",
-          cursor: "pointer",
-          padding: 0,
-          opacity: 0.6,
-        }}
+        className="flex items-center gap-1.5 text-xs text-muted-foreground bg-transparent border-none cursor-pointer p-0 opacity-60"
       >
-        <span style={{ fontSize: 10 }}>{expanded ? "\u25BC" : "\u25B6"}</span>
+        <span className="text-[10px]">{expanded ? "\u25BC" : "\u25B6"}</span>
         <span>{isLive ? "Thinking\u2026" : "Thought process"}</span>
-        {isLive && <span className="chat-tool-pulse" style={{ color: "var(--primary, #2563eb)" }}>{"\u25CF"}</span>}
+        {isLive && <span className="chat-tool-pulse text-primary">{"\u25CF"}</span>}
       </button>
       {expanded && (
-        <div style={{
-          marginTop: 4,
-          paddingLeft: 20,
-          fontSize: 12,
-          color: "var(--muted-foreground, #94a3b8)",
-          opacity: 0.5,
-          lineHeight: 1.6,
-          whiteSpace: "pre-wrap",
-          borderLeft: "2px solid var(--border, #e2e8f0)",
-          marginLeft: 6,
-        }}>
+        <div className="mt-1 pl-5 text-xs text-muted-foreground opacity-50 leading-relaxed whitespace-pre-wrap border-l-2 border-border ml-1.5">
           {content}
         </div>
       )}
@@ -313,57 +342,26 @@ function ToolCallDetail({ seg, isLive }: { seg: Extract<ChatSegment, { kind: "to
   const [expanded, setExpanded] = useState(false);
   const hasResult = seg.result !== undefined;
   return (
-    <div style={{ margin: "2px 0" }}>
+    <div className="my-0.5">
       <button
         onClick={() => setExpanded(!expanded)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 4,
-          fontSize: 11,
-          color: "var(--muted-foreground, #94a3b8)",
-          background: "none",
-          border: "none",
-          cursor: "pointer",
-          padding: "2px 0",
-          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-          opacity: 0.7,
-        }}
+        className="flex items-center gap-1 text-[11px] text-muted-foreground bg-transparent border-none cursor-pointer py-0.5 px-0 font-mono opacity-70"
       >
-        <span style={{ fontSize: 9 }}>{expanded ? "\u25BC" : "\u25B6"}</span>
+        <span className="text-[9px]">{expanded ? "\u25BC" : "\u25B6"}</span>
         <span>{seg.name}</span>
-        {!hasResult && isLive && <span className="chat-tool-pulse" style={{ color: "#f59e0b", fontSize: 8 }}>{"\u25CF"}</span>}
-        {hasResult && seg.isError && <span style={{ color: "#ef4444", fontSize: 10 }}>{"\u2715"}</span>}
-        {hasResult && !seg.isError && <span style={{ color: "#22c55e", fontSize: 10 }}>{"\u2713"}</span>}
+        {!hasResult && isLive && <span className="chat-tool-pulse text-[#f59e0b] text-[8px]">{"\u25CF"}</span>}
+        {hasResult && seg.isError && <span className="text-[#ef4444] text-[10px]">{"\u2715"}</span>}
+        {hasResult && !seg.isError && <span className="text-[#22c55e] text-[10px]">{"\u2713"}</span>}
       </button>
       {expanded && (
-        <div style={{
-          marginLeft: 16,
-          fontSize: 11,
-          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-        }}>
+        <div className="ml-4 text-[11px] font-mono">
           {seg.input != null && (
-            <div style={{
-              padding: "4px 8px",
-              background: "rgba(0,0,0,0.06)",
-              borderRadius: 3,
-              marginBottom: 4,
-              maxHeight: 100,
-              overflow: "auto",
-              color: "var(--muted-foreground, #94a3b8)",
-            }}>
+            <div className="p-1 px-2 bg-[rgba(0,0,0,0.06)] rounded-sm mb-1 max-h-[100px] overflow-auto text-muted-foreground">
               {typeof seg.input === "string" ? seg.input : JSON.stringify(seg.input, null, 2)}
             </div>
           )}
           {seg.result && (
-            <div style={{
-              padding: "4px 8px",
-              background: seg.isError ? "rgba(239,68,68,0.08)" : "rgba(0,0,0,0.04)",
-              borderRadius: 3,
-              maxHeight: 120,
-              overflow: "auto",
-              color: seg.isError ? "#ef4444" : "var(--muted-foreground, #94a3b8)",
-            }}>
+            <div className={`p-1 px-2 rounded-sm max-h-[120px] overflow-auto ${seg.isError ? "bg-[rgba(239,68,68,0.08)] text-[#ef4444]" : "bg-[rgba(0,0,0,0.04)] text-muted-foreground"}`}>
               {seg.result}
             </div>
           )}
@@ -385,48 +383,32 @@ function ActivityGroup({ segments, isLive }: { segments: ChatSegment[]; isLive: 
     : undefined;
 
   return (
-    <div style={{ margin: "2px 0", opacity: 0.5 }}>
+    <div className="my-0.5 opacity-50">
       <button
         onClick={() => setExpanded(!expanded)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          fontSize: 11,
-          color: "var(--muted-foreground, #94a3b8)",
-          background: "none",
-          border: "none",
-          cursor: "pointer",
-          padding: "2px 0",
-          opacity: 0.8,
-        }}
+        className="flex items-center gap-1.5 text-[11px] text-muted-foreground bg-transparent border-none cursor-pointer py-0.5 px-0 opacity-80"
       >
-        <span style={{ fontSize: 9 }}>{expanded ? "\u25BC" : "\u25B6"}</span>
+        <span className="text-[9px]">{expanded ? "\u25BC" : "\u25B6"}</span>
         {isLive && activeTool && activeTool.kind === "tool" ? (
           <span>
-            Running <span style={{ fontFamily: "monospace" }}>{activeTool.name}</span>
-            {toolCount > 1 && <span style={{ opacity: 0.6 }}>{" \u00B7 "}{toolCount} tools</span>}
+            Running <span className="font-mono">{activeTool.name}</span>
+            {toolCount > 1 && <span className="opacity-60">{" \u00B7 "}{toolCount} tools</span>}
           </span>
         ) : (
           <span>
             Used {toolCount} tool{toolCount !== 1 ? "s" : ""}
-            <span style={{ opacity: 0.5, marginLeft: 4 }}>{summarizeTools(segments)}</span>
+            <span className="opacity-50 ml-1">{summarizeTools(segments)}</span>
           </span>
         )}
         {isLive && !allDone && (
-          <span className="chat-tool-pulse" style={{ color: "#f59e0b", fontSize: 8 }}>{"\u25CF"}</span>
+          <span className="chat-tool-pulse text-[#f59e0b] text-[8px]">{"\u25CF"}</span>
         )}
         {!isLive && hasErrors && (
-          <span style={{ color: "rgba(239,68,68,0.5)", fontSize: 10 }}>has errors</span>
+          <span className="text-[rgba(239,68,68,0.5)] text-[10px]">has errors</span>
         )}
       </button>
       {expanded && (
-        <div style={{
-          marginLeft: 16,
-          marginTop: 2,
-          borderLeft: "1px solid var(--border, rgba(0,0,0,0.1))",
-          paddingLeft: 10,
-        }}>
+        <div className="ml-4 mt-0.5 border-l border-border pl-2.5">
           {segments.map((seg, i) => {
             if (seg.kind === "tool") {
               return <ToolCallDetail key={i} seg={seg} isLive={isLive} />;
@@ -465,37 +447,22 @@ function MessageRow({ msg }: { msg: ChatMessage }) {
   const hasSegments = storedSegments && storedSegments.length > 0;
 
   return (
-    <div className="chat-msg-enter" style={{
-      display: "flex",
-      gap: 12,
-      padding: "16px 0",
-    }}>
-      <div style={{
-        width: 28,
-        height: 28,
-        borderRadius: 6,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-        marginTop: 1,
-        background: isUser ? "var(--muted-foreground, #94a3b8)" : "rgba(37, 99, 235, 0.12)",
-        color: isUser ? "#fff" : "var(--primary, #2563eb)",
-      }}>
-        {isUser ? <IconUser size={15} /> : <span style={{ fontSize: 13, fontWeight: 700 }}>P</span>}
+    <div className="chat-msg-enter flex gap-3 py-4">
+      <div className={`w-7 h-7 rounded-md flex items-center justify-center shrink-0 mt-px ${isUser ? "bg-muted-foreground text-white" : "bg-primary/10 text-primary"}`}>
+        {isUser ? <IconUser size={15} /> : <span className="text-[13px] font-bold">P</span>}
       </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground, #1e293b)" }}>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline gap-2 mb-1">
+          <span className="text-[13px] font-semibold text-foreground">
             {isUser ? "You" : "Paperclip"}
           </span>
-          <span style={{ fontSize: 11, color: "var(--muted-foreground, #94a3b8)", opacity: 0.6 }}>
+          <span className="text-[11px] text-muted-foreground opacity-60">
             {formatTime(msg.createdAt)}
           </span>
         </div>
-        <div style={{ fontSize: 14, color: "var(--foreground, #1e293b)", lineHeight: 1.6 }}>
+        <div className="text-sm text-foreground leading-relaxed">
           {isUser ? (
-            <p style={{ margin: 0, whiteSpace: "pre-wrap" }}><IssueLinkedText text={msg.content} /></p>
+            <p className="m-0 whitespace-pre-wrap"><IssueLinkedText text={msg.content} /></p>
           ) : hasSegments ? (
             groupSegments(storedSegments).map((group, i) => {
               if (group.type === "text") {
@@ -510,20 +477,9 @@ function MessageRow({ msg }: { msg: ChatMessage }) {
               }
               if (group.type === "error") {
                 return (
-                  <div key={i} className="chat-msg-enter" style={{
-                    margin: "6px 0",
-                    padding: "8px 12px",
-                    borderRadius: 6,
-                    background: "rgba(239, 68, 68, 0.08)",
-                    border: "1px solid rgba(239, 68, 68, 0.15)",
-                    fontSize: 13,
-                    color: "#ef4444",
-                    display: "flex",
-                    alignItems: "flex-start",
-                    gap: 8,
-                  }}>
-                    <span style={{ flexShrink: 0, marginTop: 1, fontSize: 12 }}>!</span>
-                    <span style={{ whiteSpace: "pre-wrap" }}>{group.content}</span>
+                  <div key={i} className="chat-msg-enter my-1.5 py-2 px-3 rounded-md bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.15)] text-[13px] text-[#ef4444] flex items-start gap-2">
+                    <span className="shrink-0 mt-px text-xs">!</span>
+                    <span className="whitespace-pre-wrap">{group.content}</span>
                   </div>
                 );
               }
@@ -574,35 +530,20 @@ function StreamingMessage({
   }
 
   return (
-    <div className="chat-msg-enter" style={{
-      display: "flex",
-      gap: 12,
-      padding: "16px 0",
-    }}>
-      <div style={{
-        width: 28,
-        height: 28,
-        borderRadius: 6,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-        marginTop: 1,
-        background: "rgba(37, 99, 235, 0.12)",
-        color: "var(--primary, #2563eb)",
-      }}>
-        <span style={{ fontSize: 13, fontWeight: 700 }}>P</span>
+    <div className="chat-msg-enter flex gap-3 py-4">
+      <div className="w-7 h-7 rounded-md flex items-center justify-center shrink-0 mt-px bg-primary/10 text-primary">
+        <span className="text-[13px] font-bold">P</span>
       </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 4 }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground, #1e293b)" }}>Paperclip</span>
-          <span style={{ fontSize: 11, color: "var(--muted-foreground, #94a3b8)", opacity: 0.6 }}>now</span>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline gap-2 mb-1">
+          <span className="text-[13px] font-semibold text-foreground">Paperclip</span>
+          <span className="text-[11px] text-muted-foreground opacity-60">now</span>
         </div>
-        <div style={{ fontSize: 14, color: "var(--foreground, #1e293b)", lineHeight: 1.6 }}>
+        <div className="text-sm text-foreground leading-relaxed">
           {!hasAnyContent && isActive && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--muted-foreground, #94a3b8)" }}>
-              <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>&#x27F3;</span>
-              <span style={{ fontSize: 12 }}>Thinking&#x2026;</span>
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <span className="inline-block" style={{ animation: "spin 1s linear infinite" }}>&#x27F3;</span>
+              <span className="text-xs">Thinking&#x2026;</span>
             </div>
           )}
 
@@ -620,40 +561,18 @@ function StreamingMessage({
             }
             if (group.type === "error") {
               return (
-                <div key={gi} className="chat-msg-enter" style={{
-                  margin: "6px 0",
-                  padding: "8px 12px",
-                  borderRadius: 6,
-                  background: "rgba(239, 68, 68, 0.08)",
-                  border: "1px solid rgba(239, 68, 68, 0.15)",
-                  fontSize: 13,
-                  color: "#ef4444",
-                  display: "flex",
-                  alignItems: "flex-start",
-                  gap: 8,
-                }}>
-                  <span style={{ flexShrink: 0, marginTop: 1, fontSize: 12 }}>!</span>
-                  <span style={{ whiteSpace: "pre-wrap" }}>{group.content}</span>
+                <div key={gi} className="chat-msg-enter my-1.5 py-2 px-3 rounded-md bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.15)] text-[13px] text-[#ef4444] flex items-start gap-2">
+                  <span className="shrink-0 mt-px text-xs">!</span>
+                  <span className="whitespace-pre-wrap">{group.content}</span>
                 </div>
               );
             }
             return null;
           })}
           {streamingError && (
-            <div className="chat-msg-enter" style={{
-              margin: "6px 0",
-              padding: "8px 12px",
-              borderRadius: 6,
-              background: "rgba(239, 68, 68, 0.08)",
-              border: "1px solid rgba(239, 68, 68, 0.15)",
-              fontSize: 13,
-              color: "#ef4444",
-              display: "flex",
-              alignItems: "flex-start",
-              gap: 8,
-            }}>
-              <span style={{ flexShrink: 0, marginTop: 1, fontSize: 12 }}>!</span>
-              <span style={{ whiteSpace: "pre-wrap" }}>{streamingError}</span>
+            <div className="chat-msg-enter my-1.5 py-2 px-3 rounded-md bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.15)] text-[13px] text-[#ef4444] flex items-start gap-2">
+              <span className="shrink-0 mt-px text-xs">!</span>
+              <span className="whitespace-pre-wrap">{streamingError}</span>
             </div>
           )}
         </div>
@@ -695,10 +614,7 @@ function IssueLinkedText({ text }: { text: string }) {
     <>
       {parts.map((part, i) =>
         /^#[A-Z][A-Z0-9]*-\d+$/.test(part) ? (
-          <span key={i} style={{
-            color: "var(--primary, #2563eb)",
-            fontWeight: 500,
-          }}>
+          <span key={i} className="text-primary font-medium">
             {part}
           </span>
         ) : (
@@ -776,73 +692,27 @@ function ChatInput({
   setSelectedModel: (v: string) => void;
 }) {
   return (
-    <div style={{ position: "relative" }}>
+    <div className="relative">
       {showSlashMenu && (
-        <div style={{
-          position: "absolute",
-          bottom: "100%",
-          left: 0,
-          right: 0,
-          marginBottom: 4,
-          background: "var(--card, #fff)",
-          border: "1px solid var(--border, #e2e8f0)",
-          borderRadius: 8,
-          boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
-          overflow: "hidden",
-          zIndex: 50,
-        }}>
-          <div style={{
-            padding: "6px 12px",
-            borderBottom: "1px solid var(--border, #e2e8f0)",
-          }}>
-            <span style={{
-              fontSize: 10,
-              fontWeight: 600,
-              textTransform: "uppercase",
-              letterSpacing: "0.05em",
-              color: "var(--muted-foreground, #94a3b8)",
-              opacity: 0.6,
-            }}>
+        <div className="absolute bottom-full left-0 right-0 mb-1 bg-card border border-border rounded-lg shadow-lg overflow-hidden z-50">
+          <div className="px-3 py-1.5 border-b border-border">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground opacity-60">
               Commands
             </span>
           </div>
-          <div className="chat-scroll" style={{ maxHeight: 240, overflowY: "auto", padding: "4px 0" }}>
+          <div className="chat-scroll max-h-60 overflow-y-auto py-1">
             {filteredCommands.map((cmd, i) => (
               <button
                 key={cmd.name}
                 ref={i === slashMenuIndex ? (el) => el?.scrollIntoView({ block: "nearest" }) : undefined}
                 onClick={() => selectCommand(cmd)}
                 onMouseEnter={() => setSlashMenuIndex(i)}
-                style={{
-                  width: "100%",
-                  textAlign: "left",
-                  padding: "8px 12px",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  border: "none",
-                  background: i === slashMenuIndex ? "var(--accent, #f1f5f9)" : "transparent",
-                  color: "var(--foreground, #1e293b)",
-                  cursor: "pointer",
-                  fontSize: 13,
-                  transition: "background 100ms",
-                }}
+                className={`w-full text-left py-2 px-3 flex items-center gap-2 border-none text-foreground cursor-pointer text-[13px] transition-colors duration-100 ${i === slashMenuIndex ? "bg-accent" : "bg-transparent"}`}
               >
-                <span style={{
-                  fontWeight: 600,
-                  color: "var(--primary, #2563eb)",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                }}>
+                <span className="font-semibold text-primary font-mono text-xs">
                   /{cmd.name}
                 </span>
-                <span style={{
-                  color: "var(--muted-foreground, #94a3b8)",
-                  fontSize: 12,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}>
+                <span className="text-muted-foreground text-xs overflow-hidden text-ellipsis whitespace-nowrap">
                   {cmd.description}
                 </span>
               </button>
@@ -852,19 +722,7 @@ function ChatInput({
       )}
 
       {/* Unified input container */}
-      <div
-        className="chat-input-glow"
-        style={{
-          display: "flex",
-          alignItems: "flex-end",
-          gap: 0,
-          border: "1px solid var(--border, #e2e8f0)",
-          borderRadius: 12,
-          background: "var(--background, #fff)",
-          padding: "4px 4px 4px 12px",
-          transition: "border-color 150ms, box-shadow 150ms",
-        }}
-      >
+      <div className="chat-input-glow flex items-end border border-border rounded-xl bg-background pl-3 pr-1 py-1 transition-all duration-150">
         <textarea
           ref={textareaRef}
           value={input}
@@ -875,37 +733,12 @@ function ChatInput({
           onKeyDown={onKeyDown}
           placeholder={placeholder}
           rows={1}
-          style={{
-            flex: 1,
-            resize: "none",
-            padding: "6px 8px",
-            border: "none",
-            fontSize: 14,
-            fontFamily: "inherit",
-            background: "transparent",
-            color: "var(--foreground, #1e293b)",
-            outline: "none",
-            minHeight: 32,
-            height: 32,
-            lineHeight: "20px",
-          }}
+          className="flex-1 resize-none py-1.5 px-2 border-none text-sm font-[inherit] bg-transparent text-foreground outline-none min-h-[32px] h-[32px] leading-5"
         />
         {isStreaming ? (
           <button
             onClick={onStop}
-            style={{
-              width: 32,
-              height: 32,
-              borderRadius: 8,
-              border: "none",
-              background: "var(--destructive, #ef4444)",
-              color: "#fff",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              flexShrink: 0,
-            }}
+            className="w-8 h-8 rounded-lg border-none bg-destructive text-white cursor-pointer flex items-center justify-center shrink-0"
             title="Stop"
           >
             <IconStop size={14} />
@@ -914,21 +747,7 @@ function ChatInput({
           <button
             onClick={onSend}
             disabled={!input.trim() || sending}
-            style={{
-              width: 32,
-              height: 32,
-              borderRadius: 8,
-              border: "none",
-              background: input.trim() && !sending ? "var(--primary, #2563eb)" : "var(--muted-foreground, #94a3b8)",
-              color: "#fff",
-              cursor: input.trim() && !sending ? "pointer" : "not-allowed",
-              opacity: input.trim() && !sending ? 1 : 0.3,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              flexShrink: 0,
-              transition: "opacity 150ms, background 150ms",
-            }}
+            className={`w-8 h-8 rounded-lg border-none text-white flex items-center justify-center shrink-0 transition-all duration-150 ${input.trim() && !sending ? "bg-primary cursor-pointer opacity-100" : "bg-muted-foreground cursor-not-allowed opacity-30"}`}
             title="Send"
           >
             <IconSend size={14} />
@@ -937,30 +756,14 @@ function ChatInput({
       </div>
 
       {/* Adapter / model selector row */}
-      <div style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 4,
-        marginTop: 6,
-        fontSize: 11,
-        color: "var(--muted-foreground, #94a3b8)",
-        padding: "0 4px",
-      }}>
+      <div className="flex items-center gap-1 mt-1.5 text-[11px] text-muted-foreground px-1">
         {availableAdapters.length > 0 && (
-          <span style={{ cursor: selectedThread ? "default" : "pointer", opacity: selectedThread ? 0.5 : 0.7 }}>
+          <span className={selectedThread ? "cursor-default opacity-50" : "cursor-pointer opacity-70"}>
             {availableAdapters.length > 1 && !selectedThread ? (
               <select
                 value={selectedAdapter}
                 onChange={(e) => setSelectedAdapter(e.target.value)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "inherit",
-                  fontSize: "inherit",
-                  cursor: "pointer",
-                  padding: 0,
-                  fontFamily: "inherit",
-                }}
+                className="bg-transparent border-none text-[inherit] text-[inherit] cursor-pointer p-0 font-[inherit]"
               >
                 {availableAdapters.map((a) => (
                   <option key={a.type} value={a.type}>{a.label}</option>
@@ -973,20 +776,12 @@ function ChatInput({
         )}
         {currentModels.length > 0 && (
           <>
-            <span style={{ opacity: 0.4 }}>/</span>
-            <span style={{ opacity: 0.7 }}>
+            <span className="opacity-40">/</span>
+            <span className="opacity-70">
               <select
                 value={selectedModel}
                 onChange={(e) => setSelectedModel(e.target.value)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "inherit",
-                  fontSize: "inherit",
-                  cursor: "pointer",
-                  padding: 0,
-                  fontFamily: "inherit",
-                }}
+                className="bg-transparent border-none text-[inherit] text-[inherit] cursor-pointer p-0 font-[inherit]"
               >
                 {currentModels.map((m) => (
                   <option key={m.id} value={m.id}>{m.label}</option>
@@ -995,7 +790,7 @@ function ChatInput({
             </span>
           </>
         )}
-        <span style={{ marginLeft: "auto", opacity: 0.4 }}>Shift+Enter for new line</span>
+        <span className="ml-auto opacity-40">Shift+Enter for new line</span>
       </div>
     </div>
   );
@@ -1007,6 +802,10 @@ function ChatInput({
 
 export function ChatPage(_props: PluginPageProps) {
   const { companyId } = useHostContext();
+
+  // Container ref for useAvailableHeight
+  const containerRef = useRef<HTMLDivElement>(null);
+  const availableHeight = useAvailableHeight(containerRef, { bottomPadding: 24, minHeight: 384 });
 
   // Thread state
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
@@ -1322,39 +1121,23 @@ export function ChatPage(_props: PluginPageProps) {
   };
 
   return (
-    <div style={{ display: "flex", height: "calc(100vh - 8rem)", fontFamily: "system-ui, -apple-system, sans-serif" }}>
+    <div
+      ref={containerRef}
+      className="flex font-[system-ui,-apple-system,sans-serif]"
+      style={availableHeight ? { height: availableHeight } : { height: "calc(100vh - 8rem)" }}
+    >
       <style dangerouslySetInnerHTML={{ __html: CHAT_STYLES }} />
 
       {/* ── Sidebar ── */}
-      <div style={{
-        width: sidebarCollapsed ? 0 : 220,
-        borderRight: sidebarCollapsed ? "none" : "1px solid var(--border, #e2e8f0)",
-        display: "flex",
-        flexDirection: "column",
-        background: "var(--card, #fff)",
-        transition: "width 200ms ease",
-        overflow: "hidden",
-        flexShrink: 0,
-      }}>
+      <div
+        className={`flex flex-col bg-card transition-all duration-200 overflow-hidden shrink-0 ${sidebarCollapsed ? "" : "border-r border-border"}`}
+        style={{ width: sidebarCollapsed ? 0 : 220 }}
+      >
         {/* New Chat button */}
-        <div style={{ padding: "12px" }}>
+        <div className="p-3">
           <button
             onClick={() => { setSelectedThreadId(null); setInput(""); }}
-            style={{
-              width: "100%",
-              padding: "8px 12px",
-              borderRadius: 8,
-              border: "1px solid var(--border, #e2e8f0)",
-              background: "transparent",
-              color: "var(--foreground, #1e293b)",
-              cursor: "pointer",
-              fontSize: 13,
-              fontWeight: 500,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 6,
-            }}
+            className="w-full py-2 px-3 rounded-lg border border-border bg-transparent text-foreground cursor-pointer text-[13px] font-medium flex items-center justify-center gap-1.5"
           >
             <IconPlus size={14} />
             New Chat
@@ -1362,26 +1145,17 @@ export function ChatPage(_props: PluginPageProps) {
         </div>
 
         {/* Thread list */}
-        <div className="chat-scroll" style={{ flex: 1, overflow: "auto" }}>
+        <div className="chat-scroll flex-1 overflow-auto">
           {threads?.map((thread) => (
             <div
               key={thread.id}
-              className={`chat-sidebar-thread ${thread.id === selectedThreadId ? "active" : ""}`}
               onClick={() => setSelectedThreadId(thread.id)}
-              style={{
-                padding: "10px 12px",
-                cursor: "pointer",
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 10,
-                background: thread.id === selectedThreadId ? "var(--accent, rgba(0,0,0,0.06))" : "transparent",
-                transition: "background 100ms",
-              }}
+              className={`py-2.5 px-3 cursor-pointer flex items-start gap-2.5 transition-colors duration-100 hover:bg-accent ${thread.id === selectedThreadId ? "bg-accent" : "bg-transparent"}`}
             >
-              <span style={{ flexShrink: 0, marginTop: 2, color: "var(--muted-foreground, #94a3b8)", opacity: 0.5 }}>
+              <span className="shrink-0 mt-0.5 text-muted-foreground opacity-50">
                 <IconChat size={14} />
               </span>
-              <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="flex-1 min-w-0">
                 {editingThreadId === thread.id ? (
                   <input
                     autoFocus
@@ -1400,16 +1174,7 @@ export function ChatPage(_props: PluginPageProps) {
                       if (e.key === "Escape") setEditingThreadId(null);
                     }}
                     onClick={(e) => e.stopPropagation()}
-                    style={{
-                      fontSize: 13,
-                      width: "100%",
-                      background: "transparent",
-                      border: "1px solid var(--border, #e2e8f0)",
-                      borderRadius: 4,
-                      padding: "1px 4px",
-                      color: "var(--foreground, #1e293b)",
-                      outline: "none",
-                    }}
+                    className="text-[13px] w-full bg-transparent border border-border rounded px-1 py-px text-foreground outline-none"
                   />
                 ) : (
                   <div
@@ -1418,36 +1183,16 @@ export function ChatPage(_props: PluginPageProps) {
                       setEditingThreadId(thread.id);
                       setEditingTitle(thread.title || "New Chat");
                     }}
-                    style={{
-                      fontSize: 13,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      color: "var(--foreground, #1e293b)",
-                    }}
+                    className="text-[13px] overflow-hidden text-ellipsis whitespace-nowrap text-foreground"
                   >
                     {thread.title || "New Chat"}
                   </div>
                 )}
-                <div style={{
-                  fontSize: 10,
-                  color: "var(--muted-foreground, #94a3b8)",
-                  marginTop: 2,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 4,
-                }}>
+                <div className="text-[10px] text-muted-foreground mt-0.5 flex items-center gap-1">
                   <span>{formatTime(thread.updatedAt)}</span>
                   {thread.status === "running" && (
                     <span
-                      className="chat-tool-pulse"
-                      style={{
-                        display: "inline-block",
-                        width: 6,
-                        height: 6,
-                        borderRadius: "50%",
-                        background: "#22c55e",
-                      }}
+                      className="chat-tool-pulse inline-block w-1.5 h-1.5 rounded-full bg-[#22c55e]"
                     />
                   )}
                 </div>
@@ -1462,19 +1207,7 @@ export function ChatPage(_props: PluginPageProps) {
                     setConfirmDeleteId(thread.id);
                   }
                 }}
-                style={{
-                  background: "none",
-                  border: "none",
-                  cursor: "pointer",
-                  color: confirmDeleteId === thread.id ? "#ef4444" : "var(--muted-foreground, #94a3b8)",
-                  fontSize: confirmDeleteId === thread.id ? 10 : 14,
-                  padding: "2px 4px",
-                  fontWeight: confirmDeleteId === thread.id ? 600 : 400,
-                  transition: "color 150ms",
-                  whiteSpace: "nowrap",
-                  opacity: 0.5,
-                  marginTop: 1,
-                }}
+                className={`bg-transparent border-none cursor-pointer px-1 py-0.5 whitespace-nowrap opacity-50 mt-px transition-colors duration-150 ${confirmDeleteId === thread.id ? "text-[#ef4444] text-[10px] font-semibold" : "text-muted-foreground text-sm font-normal"}`}
                 title={confirmDeleteId === thread.id ? "Click again to confirm" : "Delete thread"}
               >
                 {confirmDeleteId === thread.id ? "Delete?" : "\u00d7"}
@@ -1485,57 +1218,30 @@ export function ChatPage(_props: PluginPageProps) {
       </div>
 
       {/* ── Main area ── */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+      <div className="flex-1 flex flex-col min-w-0">
 
         {/* ── Messages area ── */}
-        <div className="chat-scroll" style={{ flex: 1, overflow: "auto", padding: "0 32px", position: "relative" }}>
+        <div className="chat-scroll flex-1 overflow-auto px-8 relative">
           {/* Sidebar toggle */}
           <button
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            style={{
-              position: "sticky",
-              top: 8,
-              left: 0,
-              zIndex: 10,
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              color: "var(--muted-foreground, #94a3b8)",
-              padding: 4,
-              display: "flex",
-              alignItems: "center",
-              opacity: 0.4,
-              marginBottom: -28,
-            }}
+            className="sticky top-2 left-0 z-10 bg-transparent border-none cursor-pointer text-muted-foreground p-1 flex items-center opacity-40 -mb-7"
             title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
           >
             <IconSidebar size={16} />
           </button>
           {/* Welcome screen */}
           {!selectedThreadId && (
-            <div style={{
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              height: "100%",
-              gap: 20,
-              padding: "0 24px",
-            }}>
-              <div style={{ color: "var(--muted-foreground, #94a3b8)", opacity: 0.3 }}>
+            <div className="flex flex-col items-center justify-center h-full gap-5 px-6">
+              <div className="text-muted-foreground opacity-30">
                 <IconChat size={32} />
               </div>
-              <h2 style={{
-                fontSize: 18,
-                fontWeight: 600,
-                color: "var(--foreground, #1e293b)",
-                margin: 0,
-              }}>
+              <h2 className="text-lg font-semibold text-foreground m-0">
                 What can I help with?
               </h2>
 
               {/* Input on welcome screen */}
-              <div style={{ width: "100%", maxWidth: 520 }}>
+              <div className="w-full max-w-[520px]">
                 <ChatInput
                   {...inputProps}
                   placeholder="Ask Paperclip anything..."
@@ -1543,31 +1249,12 @@ export function ChatPage(_props: PluginPageProps) {
               </div>
 
               {/* Quick action chips */}
-              <div style={{
-                display: "flex",
-                flexWrap: "wrap",
-                justifyContent: "center",
-                gap: 8,
-                maxWidth: 520,
-              }}>
+              <div className="flex flex-wrap justify-center gap-2 max-w-[520px]">
                 {QUICK_ACTIONS.map((trigger) => (
                   <button
                     key={trigger.label}
-                    className="chat-action-chip"
                     onClick={() => handleQuickAction(trigger.prompt)}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 6,
-                      borderRadius: 8,
-                      border: "1px solid var(--border, #e2e8f0)",
-                      padding: "8px 14px",
-                      fontSize: 12,
-                      color: "var(--muted-foreground, #94a3b8)",
-                      background: "transparent",
-                      cursor: "pointer",
-                      transition: "all 150ms",
-                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-border py-2 px-3.5 text-xs text-muted-foreground bg-transparent cursor-pointer transition-all duration-150 hover:text-foreground hover:border-foreground/20 hover:bg-accent"
                   >
                     {trigger.label}
                   </button>
@@ -1576,83 +1263,34 @@ export function ChatPage(_props: PluginPageProps) {
 
               {/* Recent threads */}
               {threads && threads.length > 0 && (
-                <div style={{ width: "100%", maxWidth: 520, marginTop: 8 }}>
-                  <div style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    marginBottom: 8,
-                    padding: "0 4px",
-                  }}>
-                    <span style={{
-                      fontSize: 11,
-                      color: "var(--muted-foreground, #94a3b8)",
-                      opacity: 0.5,
-                      fontWeight: 500,
-                    }}>
+                <div className="w-full max-w-[520px] mt-2">
+                  <div className="flex items-center justify-between mb-2 px-1">
+                    <span className="text-[11px] text-muted-foreground opacity-50 font-medium">
                       Recent
                     </span>
                     {threads.length > 3 && (
                       <button
                         onClick={() => setSidebarCollapsed(false)}
-                        style={{
-                          fontSize: 11,
-                          color: "var(--muted-foreground, #94a3b8)",
-                          opacity: 0.5,
-                          background: "none",
-                          border: "none",
-                          cursor: "pointer",
-                          padding: 0,
-                        }}
+                        className="text-[11px] text-muted-foreground opacity-50 bg-transparent border-none cursor-pointer p-0"
                       >
                         View all
                       </button>
                     )}
                   </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div className="flex flex-col gap-1">
                     {threads.slice(0, 3).map((thread) => (
                       <button
                         key={thread.id}
-                        className="chat-recent-thread"
                         onClick={() => setSelectedThreadId(thread.id)}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 12,
-                          borderRadius: 8,
-                          border: "1px solid var(--border, #e2e8f0)",
-                          padding: "10px 12px",
-                          textAlign: "left",
-                          background: "transparent",
-                          cursor: "pointer",
-                          transition: "all 150ms",
-                          width: "100%",
-                        }}
+                        className="flex items-center gap-3 rounded-lg border border-border py-2.5 px-3 text-left bg-transparent cursor-pointer transition-all duration-150 w-full hover:bg-accent hover:border-foreground/10"
                       >
-                        <span style={{
-                          flexShrink: 0,
-                          color: "var(--muted-foreground, #94a3b8)",
-                          opacity: 0.3,
-                        }}>
+                        <span className="shrink-0 text-muted-foreground opacity-30">
                           <IconChat size={14} />
                         </span>
-                        <span style={{
-                          fontSize: 13,
-                          color: "var(--foreground, #1e293b)",
-                          opacity: 0.7,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          flex: 1,
-                        }}>
+                        <span className="text-[13px] text-foreground opacity-70 overflow-hidden text-ellipsis whitespace-nowrap flex-1">
                           {thread.title || "New Chat"}
                         </span>
-                        <span style={{
-                          fontSize: 10,
-                          color: "var(--muted-foreground, #94a3b8)",
-                          opacity: 0.3,
-                          flexShrink: 0,
-                        }}>
+                        <span className="text-[10px] text-muted-foreground opacity-30 shrink-0">
                           {formatTime(thread.updatedAt)}
                         </span>
                       </button>
@@ -1681,15 +1319,7 @@ export function ChatPage(_props: PluginPageProps) {
 
           {/* Empty thread placeholder */}
           {selectedThreadId && !isStreaming && (!messages || messages.length === 0) && (
-            <div style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              height: "100%",
-              color: "var(--muted-foreground, #94a3b8)",
-              fontSize: 14,
-              opacity: 0.5,
-            }}>
+            <div className="flex items-center justify-center h-full text-muted-foreground text-sm opacity-50">
               Send a message to get started
             </div>
           )}
@@ -1698,11 +1328,7 @@ export function ChatPage(_props: PluginPageProps) {
 
         {/* ── Bottom input (only when in a thread) ── */}
         {selectedThreadId && (
-          <div style={{
-            borderTop: "1px solid var(--border, #e2e8f0)",
-            padding: "12px 32px",
-            background: "var(--card, #fff)",
-          }}>
+          <div className="border-t border-border py-3 px-8 bg-card">
             <ChatInput
               {...inputProps}
               placeholder="Ask Paperclip anything..."
