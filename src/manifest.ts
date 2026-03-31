@@ -16,11 +16,6 @@ const manifest: PaperclipPluginManifestV1 = {
     // UI
     "ui.page.register",
     "ui.sidebar.register",
-    // Agent sessions (streaming chat)
-    "agent.sessions.create",
-    "agent.sessions.list",
-    "agent.sessions.send",
-    "agent.sessions.close",
     // Read agents for adapter/model discovery
     "agents.read",
     // Plugin state for thread/message persistence
@@ -62,7 +57,7 @@ const manifest: PaperclipPluginManifestV1 = {
       placementZone: "sidebar",
       action: {
         type: "navigate",
-        target: "plugins/paperclip-chat",
+        target: "/plugins/paperclip-chat",
       },
     },
   ],

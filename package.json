@@ -1,6 +1,6 @@
 {
-  "name": "@paperclipai/plugin-chat",
-  "version": "0.1.0",
+  "name": "@lucitra/paperclip-plugin-chat",
+  "version": "0.3.0",
   "description": "Multi-adapter AI chat plugin for Paperclip — supports Claude, Codex, and OpenCode",
   "type": "module",
   "exports": {
@@ -17,7 +17,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "^1.0.0"
+    "@paperclipai/plugin-sdk": "2026.331.0-canary.4",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",

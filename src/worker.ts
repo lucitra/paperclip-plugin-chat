@@ -1,5 +1,5 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import type { AgentSessionEvent, PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   ChatThread,
   ChatMessage,
@@ -356,7 +356,7 @@ const plugin = definePlugin({
       return thread;
     });
 
-    // ── Action: send message (starts streaming) ─────────────────────
+    // ── Action: send message (spawns claude CLI directly) ───────────
     ctx.actions.register("sendMessage", async (params: Record<string, unknown>) => {
       const threadId = params.threadId as string;
       const message = params.message as string;
@@ -392,191 +392,191 @@ const plugin = definePlugin({
           : message;
         const titleLine = shortTitle.split("\n")[0] ?? shortTitle;
         thread.title = titleLine;
-        // TODO: emit title_updated via stream
       }
       await saveThread(ctx, thread);
 
-      // Track whether this is the first message in the thread (new session)
-      const isNewSession = !thread.sessionId;
-
-      // Create or resume agent session
-      let sessionId = thread.sessionId;
-      if (!sessionId) {
-        // Look up a chat-suitable agent by adapter type
-        // Prefer agents with role "assistant" (dedicated chat agents) over task-oriented agents
-        const agents = await ctx.agents.list({ companyId });
-        const matching = agents.filter((a) => a.adapterType === thread.adapterType);
-        const agent = matching.find((a) => a.name === "Chat Assistant") ?? matching.find((a) => a.role === "general") ?? matching[0];
-        if (!agent) {
-          throw new Error(`No agent found with adapter type "${thread.adapterType}". Available: ${agents.map((a) => `${a.name}(${a.adapterType})`).join(", ") || "none"}`);
-        }
-        const session = await ctx.agents.sessions.create(agent.id, companyId, {
-          reason: "Chat plugin: new conversation",
-        });
-        sessionId = session.sessionId;
-        thread.sessionId = sessionId;
-        await saveThread(ctx, thread);
-      }
-
-      // Build agent context for the first message so the copilot knows about
-      // available agents and can reference them for handoff.
-      let enrichedMessage = message;
-      if (isNewSession) {
-        const allAgents = await ctx.agents.list({ companyId });
-        const agentContext = allAgents.length > 0
-          ? `[Available Agents]\n${allAgents.map(a => `- @${a.name} (Role: ${a.role ?? "general"}, Title: ${a.title ?? "N/A"}, Status: ${a.status ?? "unknown"})`).join("\n")}\n\n`
-          : "";
-        enrichedMessage = agentContext + message;
-      }
-
-      // Open SSE stream channel for this thread so the UI gets real-time events
+      // Open SSE stream channel
       const streamChannel = `chat:${threadId}`;
       ctx.streams.open(streamChannel, companyId);
 
-      // Collect response segments for persistence
-      const segments: ChatMessage["metadata"] = { segments: [] };
-      let fullResponse = "";
-
-      // Emit title update if it changed
       if (thread.title !== "New Chat") {
         ctx.streams.emit(streamChannel, { type: "title_updated", title: thread.title });
       }
 
-      // Send message and stream events.
-      // ctx.agents.sessions.sendMessage returns immediately once the run is
-      // queued — the onEvent callback fires asynchronously via JSON-RPC
-      // notifications.  We must wait for the terminal event before saving.
-      const RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-      let runId: string | undefined;
+      // Fire-and-forget: spawn claude CLI directly in the background.
+      // This bypasses the agent run queue entirely — no blocking, no heartbeat overhead.
+      void (async () => {
+        const segments: ChatMessage["metadata"] = { segments: [] };
+        let fullResponse = "";
 
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error("Chat response timed out"));
-        }, RUN_TIMEOUT_MS);
+        try {
+          const { spawn } = await import("child_process");
 
-        // Helper to process parsed stream events
-        const handleParsedEvent = (chatEvent: ChatStreamEvent) => {
-          // Accumulate for persistence
-          if (chatEvent.type === "text" && chatEvent.text) {
-            fullResponse += chatEvent.text;
-            const last = segments.segments[segments.segments.length - 1];
-            if (last && last.kind === "text") {
-              last.content += chatEvent.text;
-            } else {
-              segments.segments.push({ kind: "text", content: chatEvent.text });
-            }
+          // Build system prompt with company context
+          const allAgents = await ctx.agents.list({ companyId });
+          const agentList = allAgents.length > 0
+            ? allAgents.map(a => `- ${a.name} (role: ${a.role ?? "general"}, status: ${a.status ?? "unknown"})`).join("\n")
+            : "No agents configured";
+
+          const systemPrompt = [
+            "You are a CEO chat assistant for a Paperclip-powered company.",
+            "You help the user understand their company, plan work, and delegate tasks.",
+            "You do NOT have direct access to Paperclip APIs or CLI tools.",
+            "Answer conversationally based on the context provided.",
+            "",
+            "Available agents in this company:",
+            agentList,
+          ].join("\n");
+
+          // Build claude CLI args — lightweight chat, no tools
+          const args = [
+            "--print", "-",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", "claude-sonnet-4-6",
+            "--max-turns", "1",
+            "--dangerously-skip-permissions",
+            "--tools", "",
+            "--append-system-prompt", systemPrompt,
+          ];
+
+          // Resume session if we have one
+          if (thread.sessionId) {
+            args.push("--resume", thread.sessionId);
           }
-          if (chatEvent.type === "thinking" && chatEvent.text) {
-            const last = segments.segments[segments.segments.length - 1];
-            if (last && last.kind === "thinking") {
-              last.content += chatEvent.text;
-            } else {
-              segments.segments.push({ kind: "thinking", content: chatEvent.text });
+
+          // The plugin worker runs in a sandboxed env (no HOME, USER, etc).
+          // Spawn claude through a login shell to get the full user environment.
+          const { homedir } = await import("os");
+          const home = homedir();
+          const claudeCmd = `${home}/.local/bin/claude ${args.map(a => JSON.stringify(a)).join(" ")}`;
+
+          ctx.logger.info(`[chat] spawning: /bin/zsh -lc "${claudeCmd.slice(0, 100)}..."`);
+
+          const proc = spawn("/bin/zsh", ["-c", claudeCmd], {
+            stdio: ["pipe", "pipe", "pipe"],
+            env: {
+              HOME: home,
+              USER: "ibraheem",
+              PATH: `${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
+              TERM: "xterm-256color",
+            },
+          });
+
+          // Feed prompt via stdin
+          proc.stdin.write(message);
+          proc.stdin.end();
+
+          const parser = createStreamJsonParser((chatEvent: ChatStreamEvent) => {
+            // Accumulate for persistence
+            if (chatEvent.type === "text" && chatEvent.text) {
+              fullResponse += chatEvent.text;
+              const last = segments.segments[segments.segments.length - 1];
+              if (last && last.kind === "text") {
+                last.content += chatEvent.text;
+              } else {
+                segments.segments.push({ kind: "text", content: chatEvent.text });
+              }
             }
-          }
-          if (chatEvent.type === "tool_use") {
-            segments.segments.push({
-              kind: "tool",
-              name: chatEvent.name ?? "tool",
-              input: chatEvent.input,
+            if (chatEvent.type === "thinking" && chatEvent.text) {
+              const last = segments.segments[segments.segments.length - 1];
+              if (last && last.kind === "thinking") {
+                last.content += chatEvent.text;
+              } else {
+                segments.segments.push({ kind: "thinking", content: chatEvent.text });
+              }
+            }
+            if (chatEvent.type === "tool_use") {
+              segments.segments.push({ kind: "tool", name: chatEvent.name ?? "tool", input: chatEvent.input });
+            }
+            if (chatEvent.type === "tool_result") {
+              for (let i = segments.segments.length - 1; i >= 0; i--) {
+                const seg = segments.segments[i];
+                if (seg && seg.kind === "tool" && seg.result === undefined) {
+                  seg.result = chatEvent.content ?? "";
+                  seg.isError = chatEvent.isError ?? false;
+                  break;
+                }
+              }
+            }
+            if (chatEvent.type === "session_init" && chatEvent.sessionId) {
+              thread.sessionId = chatEvent.sessionId;
+              void saveThread(ctx, thread);
+            }
+
+            // Push to UI via SSE
+            ctx.streams.emit(streamChannel, chatEvent);
+          });
+
+          // Stream stdout through our parser
+          proc.stdout.on("data", (chunk: Buffer) => {
+            const text = chunk.toString();
+            ctx.logger.info(`[claude stdout] ${text.slice(0, 300)}`);
+            parser.push(text);
+          });
+
+          // Log stderr for debugging
+          let stderrBuf = "";
+          proc.stderr.on("data", (chunk: Buffer) => {
+            stderrBuf += chunk.toString();
+            ctx.logger.warn(`[claude stderr] ${chunk.toString().trim()}`);
+          });
+
+          // Wait for process to exit
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              proc.kill("SIGTERM");
+              reject(new Error("Chat timed out after 2 minutes"));
+            }, 120_000);
+
+            proc.on("close", (code) => {
+              clearTimeout(timer);
+              parser.flush();
+              if (code !== 0) {
+                reject(new Error(`Claude exited with code ${code}: ${stderrBuf.slice(0, 500)}`));
+              } else {
+                resolve();
+              }
             });
-          }
-          if (chatEvent.type === "tool_result") {
-            for (let i = segments.segments.length - 1; i >= 0; i--) {
-              const seg = segments.segments[i];
-              if (seg && seg.kind === "tool" && seg.result === undefined) {
-                seg.result = chatEvent.content ?? "";
-                seg.isError = chatEvent.isError ?? false;
-                break;
-              }
-            }
-          }
-          if (chatEvent.type === "session_init" && chatEvent.sessionId) {
-            thread.sessionId = chatEvent.sessionId;
-          }
 
-          // Terminal events: run completed or errored — resolve the wait
-          if (chatEvent.type === "result" || chatEvent.type === "error") {
-            clearTimeout(timer);
-            resolve();
-          }
+            proc.on("error", (err) => {
+              clearTimeout(timer);
+              reject(err);
+            });
+          });
 
-          // Push event to UI via SSE stream in real-time
-          ctx.streams.emit(streamChannel, chatEvent);
-        };
+          ctx.streams.emit(streamChannel, { type: "result" });
+        } catch (err) {
+          ctx.logger.error(`Chat error: ${err}`);
+          ctx.streams.emit(streamChannel, { type: "error", text: String(err) });
+        }
 
-        // Parse raw stdout chunks (Claude stream-json format) into events
-        const parser = createStreamJsonParser(handleParsedEvent);
+        // Save assistant message
+        if (fullResponse || segments.segments.length > 0) {
+          const assistantMsg: ChatMessage = {
+            id: generateId(),
+            threadId,
+            role: "assistant",
+            content: fullResponse,
+            metadata: segments,
+            createdAt: new Date().toISOString(),
+          };
+          const updatedMsgs = await getMessages(ctx, threadId);
+          updatedMsgs.push(assistantMsg);
+          await saveMessages(ctx, threadId, updatedMsgs);
+        }
 
-        ctx.agents.sessions.sendMessage(sessionId, companyId, {
-          prompt: enrichedMessage,
-          reason: "Chat plugin: user message",
-          onEvent: (event: AgentSessionEvent) => {
-            // The host forwards raw stdout/stderr chunks as "chunk" events.
-            // For stdout chunks, parse the Claude stream-json format.
-            if (event.eventType === "chunk") {
-              const stream = event.stream ?? (event.payload?.stream as string | undefined);
-              if (stream === "stdout" && event.message) {
-                parser.push(event.message);
-              }
-              // Ignore stderr chunks
-              return;
-            }
+        thread.status = "idle";
+        thread.updatedAt = new Date().toISOString();
+        await saveThread(ctx, thread);
 
-            // Terminal events from the host (run status changes)
-            if (event.eventType === "done") {
-              parser.flush();
-              handleParsedEvent({
-                type: "result",
-                usage: event.payload?.usage as ChatStreamEvent["usage"],
-                costUsd: event.payload?.costUsd as number | undefined,
-              });
-              return;
-            }
-            if (event.eventType === "error") {
-              parser.flush();
-              handleParsedEvent({ type: "error", text: event.message ?? "Unknown error" });
-              return;
-            }
-            if (event.eventType === "status" && event.payload?.sessionId) {
-              handleParsedEvent({ type: "session_init", sessionId: event.payload.sessionId as string });
-            }
-          },
-        }).then((result) => {
-          runId = result.runId;
-        }).catch((err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-      });
+        ctx.streams.emit(streamChannel, { type: "done" });
+        ctx.streams.close(streamChannel);
+        ctx.logger.info(`Chat completed for thread ${threadId}`);
+      })();
 
-      // Stream complete — save assistant message
-      if (fullResponse || segments.segments.length > 0) {
-        const assistantMsg: ChatMessage = {
-          id: generateId(),
-          threadId,
-          role: "assistant",
-          content: fullResponse,
-          metadata: segments,
-          createdAt: new Date().toISOString(),
-        };
-        const updatedMsgs = await getMessages(ctx, threadId);
-        updatedMsgs.push(assistantMsg);
-        await saveMessages(ctx, threadId, updatedMsgs);
-      }
-
-      // Mark thread idle
-      thread.status = "idle";
-      thread.updatedAt = new Date().toISOString();
-      await saveThread(ctx, thread);
-
-      // Signal stream completion and close the channel
-      ctx.streams.emit(streamChannel, { type: "done" });
-      ctx.streams.close(streamChannel);
-
-      ctx.logger.info(`Chat message completed`, { threadId, runId });
-
-      return { ok: true, runId };
+      // Return immediately
+      return { ok: true, streaming: true };
     });
 
     // ── Action: stop a running response ─────────────────────────────
@@ -586,11 +586,10 @@ const plugin = definePlugin({
       if (!threadId || !companyId) throw new Error("threadId and companyId required");
 
       const thread = await getThread(ctx, threadId);
-      if (!thread || !thread.sessionId) return { ok: true, stopped: false };
+      if (!thread) return { ok: true, stopped: false };
 
-      await ctx.agents.sessions.close(thread.sessionId, companyId);
+      // Mark idle — the background process will be killed by its timeout
       thread.status = "idle";
-      thread.sessionId = null; // Force new session on next message
       thread.updatedAt = new Date().toISOString();
       await saveThread(ctx, thread);
 
