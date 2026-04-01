@@ -2,6 +2,20 @@
 
 Multi-adapter AI chat plugin for Paperclip. Provides a conversational interface to Paperclip agents with thread management, slash commands, and real-time streaming.
 
+## Lucitra Fork
+
+This is [Lucitra's](https://lucitra.ai) fork of [webprismdevin/paperclip-plugin-chat](https://github.com/webprismdevin/paperclip-plugin-chat). We use it as the chat interface for our [Paperclip fork](https://github.com/lucitra/paperclip).
+
+**What this fork adds:**
+- Auto-installed as a bundled plugin on Paperclip startup
+- Integrated with our Linear plugin for issue-aware conversations
+
+**Related:**
+- [lucitra/paperclip](https://github.com/lucitra/paperclip) — Paperclip fork with Linear integration
+- [lucitra/paperclip-plugin-linear](https://github.com/lucitra/paperclip-plugin-linear) — Linear issue sync plugin
+
+---
+
 ## How It Works
 
 The plugin creates a chat UI inside the Paperclip plugin page slot. When a user sends a message, the plugin:
