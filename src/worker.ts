@@ -492,11 +492,44 @@ const plugin = definePlugin({
           // Build skills directory with Paperclip skills for Claude to discover
           skillsDir = await buildSkillsDir();
 
-          // Build system prompt with company context
-          const allAgents = await ctx.agents.list({ companyId });
+          // Pre-fetch company context for the system prompt
+          const [allAgents, allIssues, allProjects, company] = await Promise.all([
+            ctx.agents.list({ companyId }),
+            ctx.issues.list({ companyId, limit: 200 }).catch(() => [] as Array<{ status: string }>),
+            ctx.projects.list({ companyId }).catch(() => [] as Array<Record<string, unknown>>),
+            ctx.companies.get(companyId).catch(() => null),
+          ]);
+
           const agentList = allAgents.length > 0
             ? allAgents.map(a => `- ${a.name} (id: ${a.id}, role: ${a.role ?? "general"}, status: ${a.status ?? "unknown"})`).join("\n")
             : "No agents configured";
+
+          // Summarize issue counts by status
+          const issueCounts: Record<string, number> = {};
+          for (const issue of allIssues) {
+            issueCounts[issue.status] = (issueCounts[issue.status] ?? 0) + 1;
+          }
+          const issueSummary = Object.entries(issueCounts)
+            .map(([status, count]) => `  ${status}: ${count}`)
+            .join("\n") || "  No issues";
+
+          // Summarize projects with workspace paths
+          const projectSummary = allProjects.length > 0
+            ? allProjects.map(p => {
+                const ws = (p as Record<string, unknown>).primaryWorkspace as Record<string, unknown> | null;
+                const cwdInfo = ws?.cwd ? ` (cwd: ${ws.cwd})` : "";
+                return `- ${p.name} (status: ${p.status ?? "unknown"})${cwdInfo}`;
+              }).join("\n")
+            : "No projects";
+
+          // Find primary workspace cwd for Claude's working directory
+          const primaryProject = allProjects.find(p => {
+            const ws = (p as Record<string, unknown>).primaryWorkspace as Record<string, unknown> | null;
+            return ws?.cwd;
+          });
+          const workspaceCwd = primaryProject
+            ? ((primaryProject as Record<string, unknown>).primaryWorkspace as Record<string, unknown>)?.cwd as string | undefined
+            : undefined;
 
           // Find CEO agent for JWT minting (auth middleware requires real agent ID)
           const ceoAgent = allAgents.find(a => a.role === "ceo")
@@ -504,40 +537,59 @@ const plugin = definePlugin({
             ?? null;
           const authToken = ceoAgent ? mintChatToken(ceoAgent.id, companyId) : null;
 
+          // Resolve the actual API URL (server sets this at startup)
+          const paperclipApiUrl = process.env.PAPERCLIP_API_URL
+            ?? `http://127.0.0.1:${process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100"}`;
+
+          // Company name for persona
+          const companyName = (company as Record<string, unknown> | null)?.name as string | undefined ?? "this company";
+
           const systemPrompt = [
-            "You are the board's AI assistant for this Paperclip company.",
-            "You help manage agents, tasks, projects, and company operations.",
-            "You can take real actions: hire agents, create tasks, list issues, and more.",
+            `# You ARE Paperclip — the AI operating system for ${companyName}`,
             "",
-            "## How to interact with Paperclip",
+            "You are not a chatbot. You are the Paperclip platform itself, speaking directly to the board.",
+            "You have full authority to manage the company: hire agents, assign tasks, check status, review code, and take action.",
+            "You think in terms of agents, tasks, projects, and goals — the Paperclip domain model.",
             "",
+            "When the user asks to hire someone, you create an agent.",
+            "When the user asks to get something done, you create a task and assign it.",
+            "When the user asks about status, you pull live data from the API.",
+            "When the user asks to review code, you read the files in the project workspace.",
+            "",
+            "## Company Snapshot (pre-loaded)",
+            "",
+            `Company: ${companyName} (ID: ${companyId})`,
+            `API: ${paperclipApiUrl}`,
+            `Agents: ${allAgents.length} | Issues: ${allIssues.length} | Projects: ${allProjects.length}`,
+            "",
+            "### Agents",
+            agentList,
+            "",
+            "### Issues by Status",
+            issueSummary,
+            "",
+            "### Projects",
+            projectSummary,
+            "",
+            "## Dynamic Context",
+            "",
+            "The snapshot above is a starting point. For current data, use the Paperclip API via curl.",
+            "You have full Bash access to read files, run commands, and explore the project workspace.",
             skillsDir
-              ? "Use the `paperclip` skill to call Paperclip REST API endpoints via curl."
-              : "Paperclip skills are not available. Answer conversationally based on context.",
-            skillsDir
-              ? "Use the `paperclip-create-agent` skill when the user wants to hire a new agent."
+              ? "Use the `paperclip` skill for API operations and the `paperclip-create-agent` skill for hiring."
               : "",
             "",
-            "Environment variables are pre-configured:",
-            "- PAPERCLIP_API_URL — base URL for all API calls",
-            "- PAPERCLIP_COMPANY_ID — this company's ID",
+            "## Environment",
+            "",
+            `- PAPERCLIP_API_URL = ${paperclipApiUrl}`,
+            `- PAPERCLIP_COMPANY_ID = ${companyId}`,
             authToken
-              ? "- PAPERCLIP_API_KEY — auth token for API calls (use as Bearer token)"
-              : "- PAPERCLIP_API_KEY — NOT AVAILABLE (no agents exist to mint a token from)",
-            "- PAPERCLIP_RUN_ID — unique ID for this chat session",
-            "",
-            "## Key actions you can take",
-            "",
-            "- **List agents**: `curl -s -H \"Authorization: Bearer $PAPERCLIP_API_KEY\" \"$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents\"`",
-            "- **Create a task**: `POST /api/companies/{companyId}/issues` with title, assigneeAgentId, status, priority",
-            "- **Hire an agent**: use the `paperclip-create-agent` skill (it walks through the full workflow)",
-            "- **List issues**: `GET /api/companies/{companyId}/issues`",
-            "- **Get dashboard**: `GET /api/companies/{companyId}/dashboard`",
-            "",
-            `Company ID: ${companyId}`,
-            "",
-            "Available agents in this company:",
-            agentList,
+              ? "- PAPERCLIP_API_KEY = set (use as Bearer token in curl)"
+              : "- PAPERCLIP_API_KEY = NOT SET (no agents to mint token from)",
+            "- PAPERCLIP_RUN_ID = unique ID for this chat session",
+            workspaceCwd
+              ? `- Working directory: ${workspaceCwd}`
+              : "",
           ].join("\n");
 
           // Build claude CLI args — with skills and multi-turn tool use
@@ -564,12 +616,12 @@ const plugin = definePlugin({
           // The plugin worker runs in a sandboxed env (no HOME, USER, etc).
           // Spawn claude through a login shell to get the full user environment.
           const home = os.homedir();
-          const paperclipApiUrl = process.env.PAPERCLIP_API_URL
-            ?? `http://127.0.0.1:${process.env.PORT ?? "4200"}`;
           const runId = randomUUID();
-          const claudeCmd = `${home}/.local/bin/claude ${args.map(a => JSON.stringify(a)).join(" ")}`;
+          // Use workspace cwd so Claude can read project files; fall back to home
+          const spawnCwd = workspaceCwd ?? home;
+          const claudeCmd = `cd ${JSON.stringify(spawnCwd)} && ${home}/.local/bin/claude ${args.map(a => JSON.stringify(a)).join(" ")}`;
 
-          ctx.logger.info(`[chat] spawning with skills=${!!skillsDir} auth=${!!authToken}: ${claudeCmd.slice(0, 120)}...`);
+          ctx.logger.info(`[chat] spawning in ${spawnCwd} with skills=${!!skillsDir} auth=${!!authToken}`);
 
           const proc = spawn("/bin/zsh", ["-c", claudeCmd], {
             stdio: ["pipe", "pipe", "pipe"],
