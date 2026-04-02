@@ -16,8 +16,12 @@ const manifest: PaperclipPluginManifestV1 = {
     // UI
     "ui.page.register",
     "ui.sidebar.register",
-    // Read agents for adapter/model discovery
+    // Read agents for adapter/model discovery + JWT minting
     "agents.read",
+    // Read issues, projects, companies for richer context
+    "issues.read",
+    "projects.read",
+    "companies.read",
     // Plugin state for thread/message persistence
     "plugin.state.read",
     "plugin.state.write",

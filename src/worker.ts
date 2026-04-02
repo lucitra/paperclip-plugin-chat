@@ -6,8 +6,84 @@ import type {
   ChatStreamEvent,
   ChatAdapterInfo,
 } from "./types.js";
+import { createHmac, randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import * as os from "node:os";
 
 const PLUGIN_NAME = "paperclip-chat";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ---------------------------------------------------------------------------
+// Skills directory — mount Paperclip skills for Claude CLI discovery
+// ---------------------------------------------------------------------------
+
+const SKILLS_TO_MOUNT = ["paperclip", "paperclip-create-agent"];
+
+/**
+ * Create a tmpdir with `.claude/skills/` containing symlinks to Paperclip
+ * skills, so `--add-dir` makes Claude Code discover them as registered skills.
+ * Same pattern as adapter-claude-local/src/server/execute.ts.
+ */
+async function buildSkillsDir(): Promise<string | null> {
+  // Resolve skills root: from dist/worker.js → ../../paperclip/skills
+  const skillsRoot = path.resolve(__dirname, "../../paperclip/skills");
+  try {
+    await fs.access(skillsRoot);
+  } catch {
+    return null;
+  }
+
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-chat-skills-"));
+  const target = path.join(tmp, ".claude", "skills");
+  await fs.mkdir(target, { recursive: true });
+
+  for (const name of SKILLS_TO_MOUNT) {
+    const source = path.join(skillsRoot, name);
+    try {
+      await fs.access(source);
+      await fs.symlink(source, path.join(target, name));
+    } catch {
+      // Skill not found — skip silently
+    }
+  }
+
+  return tmp;
+}
+
+// ---------------------------------------------------------------------------
+// JWT minting — create a short-lived token for Paperclip API access
+// ---------------------------------------------------------------------------
+
+/**
+ * Mint a short-lived JWT for the chat plugin to authenticate with the
+ * Paperclip API. Uses the same HMAC-SHA256 mechanism as the server's
+ * `createLocalAgentJwt`. The `sub` must be a real agent ID (the auth
+ * middleware validates it against the agents table).
+ */
+function mintChatToken(agentId: string, companyId: string): string | null {
+  const secret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  if (!secret) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = JSON.stringify({ alg: "HS256", typ: "JWT" });
+  const claims = JSON.stringify({
+    sub: agentId,
+    company_id: companyId,
+    adapter_type: "chat_plugin",
+    run_id: randomUUID(),
+    iat: now,
+    exp: now + 3600, // 1 hour
+    iss: process.env.PAPERCLIP_AGENT_JWT_ISSUER ?? "paperclip",
+    aud: process.env.PAPERCLIP_AGENT_JWT_AUDIENCE ?? "paperclip-api",
+  });
+
+  const encode = (s: string) => Buffer.from(s, "utf8").toString("base64url");
+  const signingInput = `${encode(header)}.${encode(claims)}`;
+  const signature = createHmac("sha256", secret).update(signingInput).digest("base64url");
+  return `${signingInput}.${signature}`;
+}
 
 // ---------------------------------------------------------------------------
 // Claude stream-json parser
@@ -408,37 +484,77 @@ const plugin = definePlugin({
       void (async () => {
         const segments: ChatMessage["metadata"] = { segments: [] };
         let fullResponse = "";
+        let skillsDir: string | null = null;
 
         try {
           const { spawn } = await import("child_process");
 
+          // Build skills directory with Paperclip skills for Claude to discover
+          skillsDir = await buildSkillsDir();
+
           // Build system prompt with company context
           const allAgents = await ctx.agents.list({ companyId });
           const agentList = allAgents.length > 0
-            ? allAgents.map(a => `- ${a.name} (role: ${a.role ?? "general"}, status: ${a.status ?? "unknown"})`).join("\n")
+            ? allAgents.map(a => `- ${a.name} (id: ${a.id}, role: ${a.role ?? "general"}, status: ${a.status ?? "unknown"})`).join("\n")
             : "No agents configured";
 
+          // Find CEO agent for JWT minting (auth middleware requires real agent ID)
+          const ceoAgent = allAgents.find(a => a.role === "ceo")
+            ?? allAgents.find(a => a.status !== "terminated")
+            ?? null;
+          const authToken = ceoAgent ? mintChatToken(ceoAgent.id, companyId) : null;
+
           const systemPrompt = [
-            "You are a CEO chat assistant for a Paperclip-powered company.",
-            "You help the user understand their company, plan work, and delegate tasks.",
-            "You do NOT have direct access to Paperclip APIs or CLI tools.",
-            "Answer conversationally based on the context provided.",
+            "You are the board's AI assistant for this Paperclip company.",
+            "You help manage agents, tasks, projects, and company operations.",
+            "You can take real actions: hire agents, create tasks, list issues, and more.",
+            "",
+            "## How to interact with Paperclip",
+            "",
+            skillsDir
+              ? "Use the `paperclip` skill to call Paperclip REST API endpoints via curl."
+              : "Paperclip skills are not available. Answer conversationally based on context.",
+            skillsDir
+              ? "Use the `paperclip-create-agent` skill when the user wants to hire a new agent."
+              : "",
+            "",
+            "Environment variables are pre-configured:",
+            "- PAPERCLIP_API_URL — base URL for all API calls",
+            "- PAPERCLIP_COMPANY_ID — this company's ID",
+            authToken
+              ? "- PAPERCLIP_API_KEY — auth token for API calls (use as Bearer token)"
+              : "- PAPERCLIP_API_KEY — NOT AVAILABLE (no agents exist to mint a token from)",
+            "- PAPERCLIP_RUN_ID — unique ID for this chat session",
+            "",
+            "## Key actions you can take",
+            "",
+            "- **List agents**: `curl -s -H \"Authorization: Bearer $PAPERCLIP_API_KEY\" \"$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents\"`",
+            "- **Create a task**: `POST /api/companies/{companyId}/issues` with title, assigneeAgentId, status, priority",
+            "- **Hire an agent**: use the `paperclip-create-agent` skill (it walks through the full workflow)",
+            "- **List issues**: `GET /api/companies/{companyId}/issues`",
+            "- **Get dashboard**: `GET /api/companies/{companyId}/dashboard`",
+            "",
+            `Company ID: ${companyId}`,
             "",
             "Available agents in this company:",
             agentList,
           ].join("\n");
 
-          // Build claude CLI args — lightweight chat, no tools
+          // Build claude CLI args — with skills and multi-turn tool use
           const args = [
             "--print", "-",
             "--output-format", "stream-json",
             "--verbose",
             "--model", "claude-sonnet-4-6",
-            "--max-turns", "1",
+            "--max-turns", "10",
             "--dangerously-skip-permissions",
-            "--tools", "",
             "--append-system-prompt", systemPrompt,
           ];
+
+          // Mount Paperclip skills if available
+          if (skillsDir) {
+            args.push("--add-dir", skillsDir);
+          }
 
           // Resume session if we have one
           if (thread.sessionId) {
@@ -447,19 +563,26 @@ const plugin = definePlugin({
 
           // The plugin worker runs in a sandboxed env (no HOME, USER, etc).
           // Spawn claude through a login shell to get the full user environment.
-          const { homedir } = await import("os");
-          const home = homedir();
+          const home = os.homedir();
+          const paperclipApiUrl = process.env.PAPERCLIP_API_URL
+            ?? `http://127.0.0.1:${process.env.PORT ?? "4200"}`;
+          const runId = randomUUID();
           const claudeCmd = `${home}/.local/bin/claude ${args.map(a => JSON.stringify(a)).join(" ")}`;
 
-          ctx.logger.info(`[chat] spawning: /bin/zsh -lc "${claudeCmd.slice(0, 100)}..."`);
+          ctx.logger.info(`[chat] spawning with skills=${!!skillsDir} auth=${!!authToken}: ${claudeCmd.slice(0, 120)}...`);
 
           const proc = spawn("/bin/zsh", ["-c", claudeCmd], {
             stdio: ["pipe", "pipe", "pipe"],
             env: {
               HOME: home,
-              USER: "ibraheem",
+              USER: process.env.USER ?? "ibraheem",
               PATH: `${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
               TERM: "xterm-256color",
+              // Paperclip env vars for skills to use
+              PAPERCLIP_API_URL: paperclipApiUrl,
+              PAPERCLIP_COMPANY_ID: companyId,
+              PAPERCLIP_RUN_ID: runId,
+              ...(authToken ? { PAPERCLIP_API_KEY: authToken } : {}),
             },
           });
 
@@ -526,8 +649,8 @@ const plugin = definePlugin({
           await new Promise<void>((resolve, reject) => {
             const timer = setTimeout(() => {
               proc.kill("SIGTERM");
-              reject(new Error("Chat timed out after 2 minutes"));
-            }, 120_000);
+              reject(new Error("Chat timed out after 5 minutes"));
+            }, 300_000);
 
             proc.on("close", (code) => {
               clearTimeout(timer);
@@ -564,6 +687,11 @@ const plugin = definePlugin({
           const updatedMsgs = await getMessages(ctx, threadId);
           updatedMsgs.push(assistantMsg);
           await saveMessages(ctx, threadId, updatedMsgs);
+        }
+
+        // Cleanup temp skills directory
+        if (skillsDir) {
+          fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
         }
 
         thread.status = "idle";
