@@ -1,6 +1,6 @@
 {
   "name": "@lucitra/paperclip-plugin-chat",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Multi-adapter AI chat plugin for Paperclip — supports Claude, Codex, and OpenCode",
   "type": "module",
   "exports": {
