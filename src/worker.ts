@@ -85,14 +85,8 @@ function mintChatToken(agentId: string, companyId: string): string | null {
   return `${signingInput}.${signature}`;
 }
 
-// ---------------------------------------------------------------------------
-// Claude stream-json parser (extracted to stream-parser.ts for testability)
-// ---------------------------------------------------------------------------
-import { createStreamJsonParser } from "./stream-parser.js";
-
-// Removed inline parser — now imported from stream-parser.ts
-// The following block is intentionally deleted:
-// (keeping this comment as a breadcrumb for git blame)
+// stream-parser.ts is no longer used — the Agent SDK emits structured
+// messages instead of newline-delimited stream-json.
 
 // ---------------------------------------------------------------------------
 // State key helpers — all chat data lives in plugin.state
@@ -370,18 +364,17 @@ const plugin = definePlugin({
         ctx.streams.emit(streamChannel, { type: "title_updated", title: thread.title });
       }
 
-      // Fire-and-forget: spawn claude CLI directly in the background.
-      // This bypasses the agent run queue entirely — no blocking, no heartbeat overhead.
+      // Fire-and-forget: drive the Claude Agent SDK in the background.
+      // This runs in-process — no subprocess spawn, no stream-json parsing,
+      // structured tool_use/tool_result events surface directly.
       void (async () => {
         const segments: ChatMessage["metadata"] = { segments: [] };
         let fullResponse = "";
-        let skillsDir: string | null = null;
-
         try {
-          const { spawn } = await import("child_process");
+          const { query } = await import("@anthropic-ai/claude-agent-sdk");
 
-          // Build skills directory with Paperclip skills for Claude to discover
-          skillsDir = await buildSkillsDir();
+          // Skills are loaded natively by the Agent SDK via `settingSources`
+          // below — no need to build a temp dir and symlink them in.
 
           // Pre-fetch company context for the system prompt
           const [allAgents, allIssues, allProjects, company] = await Promise.all([
@@ -435,183 +428,330 @@ const plugin = definePlugin({
           // Company name for persona
           const companyName = (company as Record<string, unknown> | null)?.name as string | undefined ?? "this company";
 
+          // Terse companion context — NOT a persona override. Claude Code
+          // behaves like itself; this just tells it which company/workspace
+          // it's looking at and what Paperclip-specific MCP tools are
+          // available when relevant.
           const systemPrompt = [
-            `# You ARE Paperclip — the AI operating system for ${companyName}`,
+            `## Paperclip workspace context`,
             "",
-            "You are not a chatbot. You are the Paperclip platform itself, speaking directly to the board.",
-            "You have full authority to manage the company: hire agents, assign tasks, check status, review code, and take action.",
-            "You think in terms of agents, tasks, projects, and goals — the Paperclip domain model.",
+            `You are running inside a Paperclip chat session for ${companyName} (company ID: \`${companyId}\`).`,
+            `Paperclip API: ${paperclipApiUrl}`,
+            `Agents: ${allAgents.length} · Issues: ${allIssues.length} · Projects: ${allProjects.length}`,
+            workspaceCwd ? `Primary workspace cwd: \`${workspaceCwd}\`` : "",
             "",
-            "When the user asks to hire someone, you create an agent.",
-            "When the user asks to get something done, you create a task and assign it.",
-            "When the user asks about status, you pull live data from the API.",
-            "When the user asks to review code, you read the files in the project workspace.",
-            "",
-            "## Company Snapshot (pre-loaded)",
-            "",
-            `Company: ${companyName} (ID: ${companyId})`,
-            `API: ${paperclipApiUrl}`,
-            `Agents: ${allAgents.length} | Issues: ${allIssues.length} | Projects: ${allProjects.length}`,
-            "",
-            "### Agents",
-            agentList,
-            "",
-            "### Issues by Status",
-            issueSummary,
-            "",
-            "### Projects",
-            projectSummary,
-            "",
-            "## Dynamic Context",
-            "",
-            "The snapshot above is a starting point. For current data, use the Paperclip API via curl.",
-            "You have full Bash access to read files, run commands, and explore the project workspace.",
-            skillsDir
-              ? "Use the `paperclip` skill for API operations and the `paperclip-create-agent` skill for hiring."
-              : "",
-            "",
-            "## Environment",
-            "",
-            `- PAPERCLIP_API_URL = ${paperclipApiUrl}`,
-            `- PAPERCLIP_COMPANY_ID = ${companyId}`,
-            authToken
-              ? "- PAPERCLIP_API_KEY = set (use as Bearer token in curl)"
-              : "- PAPERCLIP_API_KEY = NOT SET (no agents to mint token from)",
-            "- PAPERCLIP_RUN_ID = unique ID for this chat session",
-            workspaceCwd
-              ? `- Working directory: ${workspaceCwd}`
-              : "",
-          ].join("\n");
+            "Paperclip-specific MCP tools are available under the `mcp__paperclip__*` namespace for Linear, Kalshi, and any other plugin in the host. Use them when the user asks about agents, tasks, projects, tickets, or trading data. Otherwise behave exactly as you would in a normal Claude Code session — read/edit files, run shell commands, search the web, etc.",
+          ]
+            .filter(Boolean)
+            .join("\n");
 
-          // Build claude CLI args — with skills and multi-turn tool use
-          const args = [
-            "--print", "-",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--model", "claude-sonnet-4-6",
-            "--max-turns", "10",
-            "--dangerously-skip-permissions",
-            "--append-system-prompt", systemPrompt,
-          ];
-
-          // Mount Paperclip skills if available
-          if (skillsDir) {
-            args.push("--add-dir", skillsDir);
+          // Resolve the @lucitra/mcp-paperclip shim. It's a file: dep, so it's
+          // always present in node_modules when the plugin installs.
+          // Built worker lives at dist/worker.js, so __dirname = dist/.
+          // Go one level up to reach the plugin root, then into node_modules.
+          const mcpShimPath = path.resolve(
+            __dirname,
+            "../node_modules/@lucitra/mcp-paperclip/dist/index.js",
+          );
+          let mcpShimOk = false;
+          try {
+            await fs.access(mcpShimPath);
+            mcpShimOk = true;
+            ctx.logger.info(`[chat] mcp shim resolved: ${mcpShimPath}`);
+          } catch {
+            ctx.logger.warn(`[chat] mcp shim NOT found at ${mcpShimPath}`);
           }
 
-          // Resume session if we have one
-          if (thread.sessionId) {
-            args.push("--resume", thread.sessionId);
-          }
-
-          // The plugin worker runs in a sandboxed env (no HOME, USER, etc).
-          // Spawn claude through a login shell to get the full user environment.
           const home = os.homedir();
-          const runId = randomUUID();
-          // Use workspace cwd so Claude can read project files; fall back to home
           const spawnCwd = workspaceCwd ?? home;
-          const claudeCmd = `cd ${JSON.stringify(spawnCwd)} && ${home}/.local/bin/claude ${args.map(a => JSON.stringify(a)).join(" ")}`;
 
-          ctx.logger.info(`[chat] spawning in ${spawnCwd} with skills=${!!skillsDir} auth=${!!authToken}`);
+          // Read the Claude Code OAuth token from the macOS Keychain once.
+          // The Agent SDK runs Claude Code under the hood; when spawned from
+          // the paperclip plugin worker's sandboxed env, it can't reliably
+          // reach the keychain itself, so we do it here and pass the token
+          // via env. The OAuth access token (sk-ant-oat01-...) is accepted
+          // by the API as a bearer, same as a plain API key.
+          // Use the REAL OS user for the keychain lookup (os.userInfo()),
+          // NOT process.env.USER — we patch that above for the worker env
+          // and it would break the `security find-generic-password -a` query.
+          const realOsUser = (() => {
+            try {
+              return os.userInfo().username;
+            } catch {
+              return process.env.LOGNAME ?? "";
+            }
+          })();
+          async function readClaudeOauthToken(): Promise<string | null> {
+            if (process.platform !== "darwin") return null;
+            if (!realOsUser) {
+              ctx.logger.warn(`[chat] no OS user; skipping keychain read`);
+              return null;
+            }
+            const { execFile } = await import("node:child_process");
+            const { promisify } = await import("node:util");
+            const execFileP = promisify(execFile);
+            try {
+              const { stdout } = await execFileP(
+                "/usr/bin/security",
+                [
+                  "find-generic-password",
+                  "-s",
+                  "Claude Code-credentials",
+                  "-a",
+                  realOsUser,
+                  "-w",
+                ],
+                { timeout: 3000 },
+              );
+              const parsed = JSON.parse(stdout.trim()) as {
+                claudeAiOauth?: { accessToken?: string };
+              };
+              const token = parsed.claudeAiOauth?.accessToken ?? null;
+              ctx.logger.info(
+                `[chat] keychain read ok user=${realOsUser} token_len=${token?.length ?? 0}`,
+              );
+              return token;
+            } catch (err) {
+              ctx.logger.warn(
+                `[chat] keychain read failed user=${realOsUser}: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              return null;
+            }
+          }
+          const claudeOauthToken = process.env.ANTHROPIC_API_KEY
+            ? process.env.ANTHROPIC_API_KEY
+            : await readClaudeOauthToken();
 
-          const proc = spawn("/bin/zsh", ["-c", claudeCmd], {
-            stdio: ["pipe", "pipe", "pipe"],
-            env: {
-              HOME: home,
-              USER: process.env.USER ?? "ibraheem",
-              PATH: `${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
-              TERM: "xterm-256color",
-              // Paperclip env vars for skills to use
-              PAPERCLIP_API_URL: paperclipApiUrl,
-              PAPERCLIP_COMPANY_ID: companyId,
-              PAPERCLIP_RUN_ID: runId,
-              ...(authToken ? { PAPERCLIP_API_KEY: authToken } : {}),
-            },
-          });
+          // The plugin worker runs in a sandboxed env (no HOME, USER, PATH).
+          // The Agent SDK in-process needs HOME to locate the Claude Code
+          // auth session at ~/.claude/ and a real PATH to resolve subprocess
+          // tools (node, git, etc). Patch process.env for this worker.
+          if (!process.env.HOME) process.env.HOME = home;
+          if (!process.env.USER) process.env.USER = process.env.LOGNAME ?? "paperclip";
+          if (!process.env.PATH) {
+            process.env.PATH = `${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`;
+          }
+          ctx.logger.info(
+            `[chat] agent-sdk cwd=${spawnCwd} HOME=${process.env.HOME} auth=${!!authToken} oauth=${!!claudeOauthToken}`,
+          );
 
-          // Feed prompt via stdin
-          proc.stdin.write(message);
-          proc.stdin.end();
-
-          const parser = createStreamJsonParser((chatEvent: ChatStreamEvent) => {
-            // Accumulate for persistence
-            if (chatEvent.type === "text" && chatEvent.text) {
-              fullResponse += chatEvent.text;
+          // Stream helper — emit to SSE and accumulate into segments for persistence.
+          const pushEvent = (ev: ChatStreamEvent) => {
+            if (ev.type === "text" && ev.text) {
+              fullResponse += ev.text;
               const last = segments.segments[segments.segments.length - 1];
-              if (last && last.kind === "text") {
-                last.content += chatEvent.text;
-              } else {
-                segments.segments.push({ kind: "text", content: chatEvent.text });
-              }
-            }
-            if (chatEvent.type === "thinking" && chatEvent.text) {
+              if (last && last.kind === "text") last.content += ev.text;
+              else segments.segments.push({ kind: "text", content: ev.text });
+            } else if (ev.type === "thinking" && ev.text) {
               const last = segments.segments[segments.segments.length - 1];
-              if (last && last.kind === "thinking") {
-                last.content += chatEvent.text;
-              } else {
-                segments.segments.push({ kind: "thinking", content: chatEvent.text });
-              }
-            }
-            if (chatEvent.type === "tool_use") {
-              segments.segments.push({ kind: "tool", name: chatEvent.name ?? "tool", input: chatEvent.input });
-            }
-            if (chatEvent.type === "tool_result") {
+              if (last && last.kind === "thinking") last.content += ev.text;
+              else segments.segments.push({ kind: "thinking", content: ev.text });
+            } else if (ev.type === "tool_use") {
+              segments.segments.push({
+                kind: "tool",
+                name: ev.name ?? "tool",
+                input: ev.input,
+              });
+            } else if (ev.type === "tool_result") {
               for (let i = segments.segments.length - 1; i >= 0; i--) {
                 const seg = segments.segments[i];
                 if (seg && seg.kind === "tool" && seg.result === undefined) {
-                  seg.result = chatEvent.content ?? "";
-                  seg.isError = chatEvent.isError ?? false;
+                  seg.result = ev.content ?? "";
+                  seg.isError = ev.isError ?? false;
                   break;
                 }
               }
-            }
-            if (chatEvent.type === "session_init" && chatEvent.sessionId) {
-              thread.sessionId = chatEvent.sessionId;
+            } else if (ev.type === "session_init" && ev.sessionId) {
+              thread.sessionId = ev.sessionId;
               void saveThread(ctx, thread);
             }
+            ctx.streams.emit(streamChannel, ev);
+          };
 
-            // Push to UI via SSE
-            ctx.streams.emit(streamChannel, chatEvent);
+          // Drive the Agent SDK. Built-in tools (Read/Write/Edit/Bash/Glob/Grep/
+          // WebSearch/WebFetch) are available via the claude_code preset, and
+          // every Paperclip plugin tool (Linear, Kalshi, …) is wired through the
+          // `paperclip` MCP server. Claude sees them as native mcp__paperclip__*
+          // tools and emits structured tool_use events.
+          const sdkMessages = query({
+            prompt: message,
+            options: {
+              model: "claude-opus-4-6",
+              cwd: spawnCwd,
+              // Load ~/.claude/ (user settings, skills, hooks, CLAUDE.md),
+              // project .claude/, and local overrides — same discovery path
+              // a regular interactive Claude Code session uses. This is why
+              // stock Claude Code "just knows" your conventions and skills.
+              settingSources: ["user", "project", "local"],
+              systemPrompt: {
+                type: "preset",
+                preset: "claude_code",
+                append: systemPrompt,
+              },
+              // Adaptive thinking is the default for opus 4.6 in the SDK;
+              // no explicit config needed. Output effort defaults to high.
+              maxTurns: 50,
+              // Chat runs in `bypassPermissions` because the user has already
+              // opted into full workspace access by opening a thread. Stock
+              // Claude Code does the same under `--dangerously-skip-permissions`.
+              permissionMode: "bypassPermissions",
+              allowDangerouslySkipPermissions: true,
+              resume: thread.sessionId ?? undefined,
+              env: {
+                HOME: process.env.HOME ?? home,
+                USER: process.env.USER ?? "paperclip",
+                PATH: process.env.PATH ?? `${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
+                // OAuth tokens (sk-ant-oat01-...) must go through
+                // CLAUDE_CODE_OAUTH_TOKEN, NOT ANTHROPIC_API_KEY — passing
+                // an oat token as ANTHROPIC_API_KEY fails with "Invalid API key".
+                // Plain API keys (sk-ant-api03-...) go in ANTHROPIC_API_KEY.
+                ...(claudeOauthToken
+                  ? claudeOauthToken.startsWith("sk-ant-oat")
+                    ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOauthToken }
+                    : { ANTHROPIC_API_KEY: claudeOauthToken }
+                  : {}),
+                PAPERCLIP_API_URL: paperclipApiUrl,
+                PAPERCLIP_COMPANY_ID: companyId,
+                ...(authToken ? { PAPERCLIP_API_KEY: authToken } : {}),
+              },
+              // MCP servers available inside chat.
+              //
+              // `paperclip` is the in-workspace shim that bridges to every
+              // plugin tool in the host (Linear, Kalshi, …). Attached
+              // unconditionally when the shim resolves — it falls back to
+              // board-implicit auth on localhost.
+              //
+              // The remaining entries are external MCP servers that
+              // Claude Code already knows how to authenticate against
+              // (Notion OAuth, Linear OAuth, gcloud ADC, etc.). They mirror
+              // the entries in lucitra-dev/.mcp.json so chat has the same
+              // surface area as Claude Code itself. Notion and Linear are
+              // HTTP-transport servers — Claude Code handles their OAuth
+              // flows and caches tokens per user under ~/.claude/.
+              mcpServers: {
+                ...(mcpShimOk
+                  ? {
+                      paperclip: {
+                        type: "stdio" as const,
+                        command: "node",
+                        args: [mcpShimPath],
+                        env: {
+                          PAPERCLIP_API_URL: paperclipApiUrl,
+                          PAPERCLIP_COMPANY_ID: companyId,
+                          ...(authToken ? { PAPERCLIP_API_KEY: authToken } : {}),
+                        },
+                      },
+                    }
+                  : {}),
+                notion: {
+                  type: "http" as const,
+                  url: "https://mcp.notion.com/mcp",
+                },
+                "linear-hosted": {
+                  type: "http" as const,
+                  url: "https://mcp.linear.app/mcp",
+                },
+                gcloud: {
+                  type: "stdio" as const,
+                  command: "npx",
+                  args: ["-y", "@google-cloud/gcloud-mcp"],
+                },
+                "gcloud-observability": {
+                  type: "stdio" as const,
+                  command: "npx",
+                  args: ["-y", "@google-cloud/observability-mcp"],
+                },
+              },
+            },
           });
 
-          // Stream stdout through our parser
-          proc.stdout.on("data", (chunk: Buffer) => {
-            const text = chunk.toString();
-            ctx.logger.info(`[claude stdout] ${text.slice(0, 300)}`);
-            parser.push(text);
-          });
+          for await (const sdkMsg of sdkMessages) {
+            ctx.logger.info(
+              `[chat] sdk msg type=${sdkMsg.type}${(sdkMsg as { subtype?: string }).subtype ? " subtype=" + (sdkMsg as { subtype: string }).subtype : ""}`,
+            );
+            // Capture the session id on init so we can resume next turn.
+            if (sdkMsg.type === "system" && sdkMsg.subtype === "init") {
+              const sid = (sdkMsg as { session_id?: string }).session_id;
+              if (sid) pushEvent({ type: "session_init", sessionId: sid });
+              continue;
+            }
 
-          // Log stderr for debugging
-          let stderrBuf = "";
-          proc.stderr.on("data", (chunk: Buffer) => {
-            stderrBuf += chunk.toString();
-            ctx.logger.warn(`[claude stderr] ${chunk.toString().trim()}`);
-          });
-
-          // Wait for process to exit
-          await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => {
-              proc.kill("SIGTERM");
-              reject(new Error("Chat timed out after 5 minutes"));
-            }, 300_000);
-
-            proc.on("close", (code) => {
-              clearTimeout(timer);
-              parser.flush();
-              if (code !== 0) {
-                reject(new Error(`Claude exited with code ${code}: ${stderrBuf.slice(0, 500)}`));
-              } else {
-                resolve();
+            // Assistant turns contain text / thinking / tool_use blocks.
+            if (sdkMsg.type === "assistant") {
+              const blocks =
+                (sdkMsg as unknown as { message?: { content?: Array<Record<string, unknown>> } }).message?.content ?? [];
+              for (const block of blocks) {
+                const btype = block.type as string | undefined;
+                if (btype === "text" && typeof block.text === "string") {
+                  pushEvent({ type: "text", text: block.text });
+                } else if (btype === "thinking" && typeof block.thinking === "string") {
+                  pushEvent({ type: "thinking", text: block.thinking });
+                } else if (btype === "tool_use") {
+                  pushEvent({
+                    type: "tool_use",
+                    name: (block.name as string) ?? "tool",
+                    input: block.input,
+                    toolUseId: block.id as string | undefined,
+                  });
+                }
               }
-            });
+              continue;
+            }
 
-            proc.on("error", (err) => {
-              clearTimeout(timer);
-              reject(err);
-            });
-          });
+            // User turns here mean tool_result blocks from the SDK.
+            if (sdkMsg.type === "user") {
+              const rawContent = (sdkMsg as unknown as { message?: { content?: unknown } }).message?.content;
+              const blocks: Array<Record<string, unknown>> = Array.isArray(rawContent)
+                ? (rawContent as Array<Record<string, unknown>>)
+                : [];
+              for (const block of blocks) {
+                if (block.type === "tool_result") {
+                  const raw = block.content;
+                  let content = "";
+                  if (typeof raw === "string") content = raw;
+                  else if (Array.isArray(raw)) {
+                    content = raw
+                      .map((b) =>
+                        typeof b === "string"
+                          ? b
+                          : (b as Record<string, unknown>).type === "text"
+                            ? String((b as Record<string, unknown>).text ?? "")
+                            : "",
+                      )
+                      .join("");
+                  }
+                  pushEvent({
+                    type: "tool_result",
+                    content,
+                    isError: Boolean(block.is_error),
+                    toolUseId: block.tool_use_id as string | undefined,
+                  });
+                }
+              }
+              continue;
+            }
 
-          ctx.streams.emit(streamChannel, { type: "result" });
+            // Terminal result message — carries usage + cost.
+            if (sdkMsg.type === "result") {
+              const usage = (sdkMsg as { usage?: unknown }).usage;
+              const cost = (sdkMsg as { total_cost_usd?: number }).total_cost_usd;
+              pushEvent({
+                type: "result",
+                usage:
+                  usage && typeof usage === "object"
+                    ? {
+                        input_tokens: Number(
+                          (usage as Record<string, unknown>).input_tokens ?? 0,
+                        ),
+                        output_tokens: Number(
+                          (usage as Record<string, unknown>).output_tokens ?? 0,
+                        ),
+                      }
+                    : undefined,
+                costUsd: typeof cost === "number" ? cost : undefined,
+              });
+            }
+          }
         } catch (err) {
           ctx.logger.error(`Chat error: ${err}`);
           ctx.streams.emit(streamChannel, { type: "error", text: String(err) });
@@ -633,9 +773,7 @@ const plugin = definePlugin({
         }
 
         // Cleanup temp skills directory
-        if (skillsDir) {
-          fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
-        }
+        // Skills dir cleanup removed — settingSources loads them natively.
 
         thread.status = "idle";
         thread.updatedAt = new Date().toISOString();
