@@ -6,6 +6,12 @@ import type {
   ChatStreamEvent,
   ChatAdapterInfo,
 } from "./types.js";
+import {
+  DEFAULT_ALLOW_RULES,
+  evaluateRules,
+  synthesizeAlwaysRule,
+  type PermissionRuleSet,
+} from "./permissions.js";
 import { createHmac, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
@@ -208,6 +214,52 @@ const plugin = definePlugin({
       return getMessages(ctx, threadId);
     });
 
+    // ── Data: pending tool-use approvals for a chat thread ─────────
+    // Hydrates the inline approval cards when the user switches back
+    // to a thread (React state was lost on unmount). Calls the central
+    // approvals API, filters by type=tool_use + status=pending, and
+    // matches on the threadId embedded in the payload.
+    ctx.data.register(
+      "pendingApprovals",
+      async (params: Record<string, unknown>) => {
+        const companyId = params.companyId as string;
+        const threadId = params.threadId as string | undefined;
+        if (!companyId) return [];
+        const apiUrl =
+          process.env.PAPERCLIP_API_URL
+          ?? `http://127.0.0.1:${process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100"}`;
+        try {
+          const res = await fetch(
+            `${apiUrl}/api/companies/${encodeURIComponent(companyId)}/approvals?status=pending`,
+            { signal: AbortSignal.timeout(5000) },
+          );
+          if (!res.ok) return [];
+          const all = (await res.json()) as Array<{
+            id: string;
+            type: string;
+            status: string;
+            payload?: Record<string, unknown> | null;
+            createdAt?: string;
+          }>;
+          return all
+            .filter((a) => a.type === "tool_use" && a.status === "pending")
+            .filter((a) => {
+              if (!threadId) return true;
+              const payloadThreadId = (a.payload as Record<string, unknown> | null)?.threadId;
+              return payloadThreadId === threadId;
+            })
+            .map((a) => ({
+              approvalId: a.id,
+              name: (a.payload as Record<string, unknown> | null)?.tool as string | undefined ?? "tool",
+              input: (a.payload as Record<string, unknown> | null)?.input,
+              requestedAt: a.createdAt ? Date.parse(a.createdAt) : Date.now(),
+            }));
+        } catch {
+          return [];
+        }
+      },
+    );
+
     // ── Data: list available adapters ───────────────────────────────
     ctx.data.register("adapters", async (params: Record<string, unknown>) => {
       const companyId = params.companyId as string;
@@ -316,6 +368,46 @@ const plugin = definePlugin({
       await saveThread(ctx, thread);
       return thread;
     });
+
+    // ── Action: resolve a tool-use approval inline from the chat UI ──
+    // Tool-use approvals flow through the central paperclip approvals
+    // API (POST /api/companies/:id/approvals with type "tool_use"). The
+    // chat UI surfaces them as inline cards via the permission_request
+    // stream event and uses this action to approve/reject without the
+    // user having to navigate to the approvals dashboard.
+    //
+    // This is a thin proxy — it calls the central approvals API on
+    // behalf of the UI. Same endpoints the board dashboard uses, same
+    // audit trail, same rule-synthesis path on the worker side
+    // (decisionNote contains "remember" → chat worker remembers).
+    ctx.actions.register(
+      "resolveBoardApproval",
+      async (params: Record<string, unknown>) => {
+        const approvalId = params.approvalId as string;
+        const decision = params.decision as "approve" | "reject";
+        const decisionNote = (params.decisionNote as string | undefined) ?? "";
+        if (!approvalId) throw new Error("approvalId required");
+        if (decision !== "approve" && decision !== "reject") {
+          throw new Error("decision must be 'approve' or 'reject'");
+        }
+        const apiUrl =
+          process.env.PAPERCLIP_API_URL
+          ?? `http://127.0.0.1:${process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100"}`;
+        const res = await fetch(
+          `${apiUrl}/api/approvals/${encodeURIComponent(approvalId)}/${decision}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decisionNote, decidedByUserId: "board" }),
+          },
+        );
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Approval ${decision} failed (${res.status}): ${text.slice(0, 300)}`);
+        }
+        return { ok: true };
+      },
+    );
 
     // ── Action: send message (spawns claude CLI directly) ───────────
     ctx.actions.register("sendMessage", async (params: Record<string, unknown>) => {
@@ -535,6 +627,163 @@ const plugin = definePlugin({
             `[chat] agent-sdk cwd=${spawnCwd} HOME=${process.env.HOME} auth=${!!authToken} oauth=${!!claudeOauthToken}`,
           );
 
+          // ── Permission rule engine ────────────────────────────────
+          // Mirrors Claude Code's permissions system (see permissions.ts).
+          //
+          // On every tool call, canUseTool:
+          //   1. Evaluates the rule set (deny > ask > allow precedence)
+          //   2. If matched by an allow rule → runs the tool
+          //   3. If matched by a deny rule → hard-deny
+          //   4. If no rule matches OR matched "ask" → creates an approval
+          //      in the central paperclip approvals inbox and waits
+          //   5. If the board approves with "remember" in the decisionNote,
+          //      synthesizes a reusable rule and appends it to
+          //      thread.allowedTools — persists for the life of the thread
+          //
+          // The rule set is:
+          //   allow = DEFAULT_ALLOW_RULES + thread.allowedTools (persisted per-thread)
+          //   deny  = (empty — no hard blocks; user can approve anything)
+          //   ask   = (empty — anything unmatched falls through to approval)
+          const buildRuleSet = (): PermissionRuleSet => ({
+            allow: [
+              ...DEFAULT_ALLOW_RULES,
+              ...(thread.allowedTools ?? []),
+            ],
+            deny: [],
+            ask: [],
+          });
+
+          // ── Approval polling helper ──────────────────────────────
+          // Creates a `tool_use` approval via the paperclip approvals
+          // plugin (POST /api/companies/:id/approvals), emits a
+          // permission_request event on the chat stream, and polls
+          // GET /api/approvals/:id until resolved or timed out. The
+          // approval shows up in the same board approvals inbox as
+          // hire_agent / budget_override / approve_ceo_strategy
+          // requests — single unified surface.
+          const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+          const APPROVAL_POLL_MS = 1500;
+          function approvalHeaders(): Record<string, string> {
+            const h: Record<string, string> = {
+              "Content-Type": "application/json",
+            };
+            if (authToken) h.Authorization = `Bearer ${authToken}`;
+            return h;
+          }
+          function summarizeToolCall(
+            toolName: string,
+            toolInput: unknown,
+          ): string {
+            // Keep the dashboard summary tight — 120 char cap.
+            const head = toolName.startsWith("mcp__")
+              ? toolName.split("__").slice(-1)[0] ?? toolName
+              : toolName;
+            try {
+              const json = JSON.stringify(toolInput ?? {});
+              const short = json.length > 80 ? json.slice(0, 77) + "..." : json;
+              return `${head} ${short}`.slice(0, 120);
+            } catch {
+              return head.slice(0, 120);
+            }
+          }
+          interface ApprovalOutcome {
+            status: "approved" | "denied" | "timeout";
+            decisionNote?: string | null;
+          }
+          async function requestToolApproval(
+            toolName: string,
+            toolInput: unknown,
+          ): Promise<ApprovalOutcome> {
+            // Create the approval record via the paperclip approvals API.
+            let approvalId: string | null = null;
+            try {
+              const createRes = await fetch(
+                `${paperclipApiUrl}/api/companies/${encodeURIComponent(companyId)}/approvals`,
+                {
+                  method: "POST",
+                  headers: approvalHeaders(),
+                  body: JSON.stringify({
+                    type: "tool_use",
+                    payload: {
+                      tool: toolName,
+                      input: toolInput,
+                      threadId,
+                      summary: summarizeToolCall(toolName, toolInput),
+                      requestedAt: new Date().toISOString(),
+                    },
+                    requestedByAgentId: ceoAgent?.id ?? null,
+                  }),
+                  signal: AbortSignal.timeout(10_000),
+                },
+              );
+              if (!createRes.ok) {
+                const errText = await createRes.text();
+                ctx.logger.warn(
+                  `[chat] approval create failed (${createRes.status}): ${errText.slice(0, 300)}`,
+                );
+                return { status: "denied" }; // fail closed
+              }
+              const created = (await createRes.json()) as { id?: string };
+              approvalId = created.id ?? null;
+            } catch (err) {
+              ctx.logger.warn(
+                `[chat] approval create threw: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              return { status: "denied" };
+            }
+
+            if (!approvalId) return { status: "denied" };
+
+            // Stream the permission_request event to the chat UI so
+            // it can render an inline approve/deny card.
+            ctx.streams.emit(streamChannel, {
+              type: "permission_request",
+              approvalId,
+              name: toolName,
+              input: toolInput,
+            } as unknown as ChatStreamEvent);
+
+            ctx.logger.info(
+              `[chat] approval created id=${approvalId} tool=${toolName}`,
+            );
+
+            // Poll the central approvals API until resolved or timeout.
+            // Status values: pending | approved | rejected | revision_requested
+            const deadline = Date.now() + APPROVAL_TIMEOUT_MS;
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, APPROVAL_POLL_MS));
+              try {
+                const res = await fetch(
+                  `${paperclipApiUrl}/api/approvals/${encodeURIComponent(approvalId)}`,
+                  {
+                    headers: approvalHeaders(),
+                    signal: AbortSignal.timeout(5000),
+                  },
+                );
+                if (!res.ok) continue;
+                const approval = (await res.json()) as {
+                  status?: string;
+                  decisionNote?: string | null;
+                };
+                if (approval.status === "approved") {
+                  return {
+                    status: "approved",
+                    decisionNote: approval.decisionNote ?? null,
+                  };
+                }
+                if (approval.status === "rejected") {
+                  return {
+                    status: "denied",
+                    decisionNote: approval.decisionNote ?? null,
+                  };
+                }
+              } catch {
+                /* transient — try again */
+              }
+            }
+            return { status: "timeout" };
+          }
+
           // Stream helper — emit to SSE and accumulate into segments for persistence.
           const pushEvent = (ev: ChatStreamEvent) => {
             if (ev.type === "text" && ev.text) {
@@ -591,11 +840,77 @@ const plugin = definePlugin({
               // Adaptive thinking is the default for opus 4.6 in the SDK;
               // no explicit config needed. Output effort defaults to high.
               maxTurns: 50,
-              // Chat runs in `bypassPermissions` because the user has already
-              // opted into full workspace access by opening a thread. Stock
-              // Claude Code does the same under `--dangerously-skip-permissions`.
-              permissionMode: "bypassPermissions",
-              allowDangerouslySkipPermissions: true,
+              // Board-in-the-loop: default permission mode + canUseTool
+              // callback below gates every mutation. Read-only tools
+              // pass through; everything else creates an approval record
+              // and waits for a board decision.
+              permissionMode: "default",
+              canUseTool: async (toolName, input) => {
+                // Evaluate the rule set (deny > ask > allow precedence).
+                const decision = evaluateRules(
+                  buildRuleSet(),
+                  toolName,
+                  input,
+                );
+                if (decision === "allow") {
+                  return {
+                    behavior: "allow" as const,
+                    updatedInput: input as Record<string, unknown>,
+                  };
+                }
+                if (decision === "deny") {
+                  return {
+                    behavior: "deny" as const,
+                    message:
+                      `This action is blocked by a deny rule. Do not retry ${toolName} with the same arguments.`,
+                  };
+                }
+
+                // No rule matched (or matched "ask") → create an approval
+                // in the central paperclip inbox and wait for the board.
+                ctx.logger.info(
+                  `[chat] permission request tool=${toolName}`,
+                );
+                const outcome = await requestToolApproval(toolName, input);
+
+                if (outcome.status === "approved") {
+                  // "Approve always": if the decisionNote contains
+                  // "remember" (case-insensitive), synthesize a reusable
+                  // rule and persist it on the thread. Next time a tool
+                  // call matching the rule runs, it skips the approval.
+                  const note = (outcome.decisionNote ?? "").toLowerCase();
+                  if (note.includes("remember") || note.includes("always")) {
+                    const newRule = synthesizeAlwaysRule(toolName, input);
+                    if (newRule) {
+                      thread.allowedTools = Array.from(
+                        new Set([...(thread.allowedTools ?? []), newRule]),
+                      );
+                      thread.updatedAt = new Date().toISOString();
+                      await saveThread(ctx, thread);
+                      ctx.logger.info(
+                        `[chat] remembered approval rule: ${newRule}`,
+                      );
+                    }
+                  }
+                  return {
+                    behavior: "allow" as const,
+                    updatedInput: input as Record<string, unknown>,
+                  };
+                }
+
+                const reasonMap: Record<string, string> = {
+                  denied: `The board denied this action. Do not retry ${toolName} with the same arguments. Describe what you were trying to accomplish and ask the user for an alternative approach.`,
+                  timeout: `Approval request for ${toolName} timed out after 5 minutes with no board decision. Treat as denied; do not retry in this turn. Report back to the user and ask them to approve via the dashboard before trying again.`,
+                };
+                ctx.logger.info(
+                  `[chat] permission ${outcome.status} tool=${toolName}`,
+                );
+                return {
+                  behavior: "deny" as const,
+                  message:
+                    reasonMap[outcome.status] ?? "Action denied by board policy.",
+                };
+              },
               resume: thread.sessionId ?? undefined,
               env: {
                 HOME: process.env.HOME ?? home,
@@ -610,6 +925,37 @@ const plugin = definePlugin({
                     ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOauthToken }
                     : { ANTHROPIC_API_KEY: claudeOauthToken }
                   : {}),
+                // ── Claude Code tuning for background/embedded use ──
+                // Opt out of telemetry, autoupdater, feedback command.
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+                // Strip Anthropic/cloud creds from Bash subprocess env
+                // to contain prompt-injection blast radius.
+                CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
+                // Resume mid-turn if the previous run died (worker crash).
+                CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1",
+                // Kill stalled API streams before they wedge the worker.
+                CLAUDE_ENABLE_STREAM_WATCHDOG: "1",
+                CLAUDE_STREAM_IDLE_TIMEOUT_MS: "120000",
+                // Prevent duplicate tool execution if a stream fails mid-flight.
+                CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: "1",
+                // Cap parallel tool use — default 10 can overwhelm a host
+                // running multiple agents side-by-side.
+                CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY: "4",
+                // Bash bounds — explicit so runaway shells don't stall.
+                BASH_DEFAULT_TIMEOUT_MS: "120000",
+                BASH_MAX_TIMEOUT_MS: "600000",
+                BASH_MAX_OUTPUT_LENGTH: "200000",
+                // Give SessionEnd hooks room for audit/cleanup.
+                CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS: "5000",
+                // We enforce maxBudgetUsd — suppress the nag warnings.
+                DISABLE_COST_WARNINGS: "1",
+                // Route spawned subagents (code-reviewer, architect, etc.)
+                // to Haiku by default — 5x cheaper, fast enough for the
+                // narrow scopes each subagent handles.
+                CLAUDE_CODE_SUBAGENT_MODEL: "claude-haiku-4-5",
+                // Paperclip plugin workers can't manage long-lived child
+                // processes cleanly; disable Bash `run_in_background`.
+                CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
                 PAPERCLIP_API_URL: paperclipApiUrl,
                 PAPERCLIP_COMPANY_ID: companyId,
                 ...(authToken ? { PAPERCLIP_API_KEY: authToken } : {}),
@@ -661,6 +1007,74 @@ const plugin = definePlugin({
                   command: "npx",
                   args: ["-y", "@google-cloud/observability-mcp"],
                 },
+              },
+
+              // ── Native subagent roles ──────────────────────────────
+              // The chat lead (opus 4.6) can invoke the built-in Agent
+              // tool to spawn any of these on demand. Each runs in its
+              // own context window with its own tool allowlist, so heavy
+              // specialist work doesn't pollute the main conversation.
+              // Keep the prompts terse — full skill docs live in
+              // ~/.claude/skills and are auto-discovered via settingSources.
+              agents: {
+                "code-reviewer": {
+                  description:
+                    "Expert code reviewer. Multi-axis review with severity labels (blocker / major / minor / nit). Use for pre-merge quality checks, security audits, and API design reviews.",
+                  prompt:
+                    "You are a senior code reviewer. Read the files under review, analyze across multiple axes (correctness, security, performance, readability, testability), and report findings with severity labels. Cite file:line. Be terse and specific — do not restate code back to the user.",
+                  tools: ["Read", "Glob", "Grep"],
+                },
+                architect: {
+                  description:
+                    "System design and implementation planning. Use for PRD → Architecture → Stories workflows, refactor proposals, and scoping decisions.",
+                  prompt:
+                    "You are a senior software architect. Before proposing any change, read the relevant code to understand existing patterns. Produce an implementation plan with: goals, non-goals, architecture sketch, phased stories, rollout risk. Prefer small composable increments over big-bang rewrites.",
+                  tools: ["Read", "Glob", "Grep"],
+                },
+                debugger: {
+                  description:
+                    "Systematic bug reproduction and root-cause analysis. Use when a test is failing, a behavior is wrong, or logs show an error.",
+                  prompt:
+                    "You are a debugging specialist. Follow the discipline: reproduce first, isolate the minimal failing case, form a hypothesis, test it, report the root cause and fix. Never guess — each claim must be backed by an observation from the code, logs, or a shell command.",
+                  tools: ["Read", "Glob", "Grep", "Bash"],
+                },
+                researcher: {
+                  description:
+                    "Open-ended exploration of a codebase or external docs. Use when the user needs a survey across many files or wants the latest info from the web.",
+                  prompt:
+                    "You are a research agent. Cast a wide net via Glob, Grep, WebSearch, and WebFetch. Take notes as you go. Produce a synthesized report with direct citations (file:line for code, URL for web). Do not modify anything.",
+                  tools: ["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
+                },
+              },
+
+              // ── Cost cap ───────────────────────────────────────────
+              // Hard ceiling per chat turn. Opus 4.6 burns through
+              // tokens quickly on deep investigations; $5 gives the
+              // agent room to iterate on a medium task without running
+              // away. User can raise this per-thread later if needed.
+              maxBudgetUsd: 5,
+
+              // ── Audit hook ──────────────────────────────────────
+              // Mutations are gated by canUseTool above (board approval
+              // required). The only hook kept is a PostToolUse audit
+              // logger so every executed tool call shows up in the
+              // server log regardless of source.
+              hooks: {
+                PostToolUse: [
+                  {
+                    matcher: ".*",
+                    hooks: [
+                      async (input) => {
+                        const toolName = (input as { tool_name?: string }).tool_name ?? "unknown";
+                        const agentType = (input as { agent_type?: string }).agent_type;
+                        ctx.logger.info(
+                          `[chat] tool_use ${toolName}${agentType ? ` [subagent:${agentType}]` : ""}`,
+                        );
+                        return {};
+                      },
+                    ],
+                  },
+                ],
               },
             },
           });

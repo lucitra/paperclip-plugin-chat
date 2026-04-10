@@ -500,18 +500,153 @@ function MessageRow({ msg }: { msg: ChatMessage }) {
 // StreamingMessage — renders the live assistant response
 // ---------------------------------------------------------------------------
 
+interface PendingApprovalUI {
+  approvalId: string;
+  name: string;
+  input: unknown;
+  requestedAt: number;
+}
+
+/** Pretty-print the short name of a tool for UI display. */
+function shortToolName(fullName: string): string {
+  if (!fullName.startsWith("mcp__")) return fullName;
+  const parts = fullName.split("__").filter(Boolean);
+  return parts[parts.length - 1] ?? fullName;
+}
+
+/**
+ * Inline approve/deny card rendered mid-conversation when Claude wants
+ * to run a tool that requires board approval. Mirrors the look of a
+ * Claude Code permission prompt — user clicks a button, the tool runs
+ * (or doesn't), the conversation continues.
+ */
+function InlineApprovalCard({
+  approval,
+  onResolve,
+}: {
+  approval: PendingApprovalUI;
+  onResolve: (
+    approvalId: string,
+    decision: "approve" | "reject",
+    decisionNote?: string,
+  ) => Promise<void>;
+}) {
+  const [resolving, setResolving] = useState<
+    "approve" | "approve-always" | "reject" | null
+  >(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const shortName = shortToolName(approval.name);
+  const isBuiltin = !approval.name.startsWith("mcp__");
+  const isBash = approval.name === "Bash";
+  const input = approval.input as Record<string, unknown> | null;
+  const bashCommand =
+    isBash && input && typeof input.command === "string"
+      ? (input.command as string)
+      : null;
+
+  const handle = async (
+    mode: "approve" | "approve-always" | "reject",
+  ) => {
+    setResolving(mode);
+    setError(null);
+    try {
+      await onResolve(
+        approval.approvalId,
+        mode === "reject" ? "reject" : "approve",
+        mode === "approve-always" ? "remember" : undefined,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setResolving(null);
+    }
+  };
+
+  return (
+    <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+      <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 mb-2">
+        <span className="text-xs font-semibold uppercase tracking-wide">
+          Approval required
+        </span>
+        <span className="font-mono text-xs bg-amber-500/10 px-1.5 py-0.5 rounded">
+          {shortName}
+        </span>
+        {!isBuiltin && <span className="text-[10px] opacity-70">(plugin)</span>}
+      </div>
+
+      {bashCommand && (
+        <pre className="mb-2 rounded bg-background/60 px-2 py-1.5 font-mono text-[11px] whitespace-pre-wrap break-all overflow-x-auto">
+          {bashCommand}
+        </pre>
+      )}
+      {!bashCommand && input !== undefined && input !== null && (
+        <pre className="mb-2 rounded bg-background/60 px-2 py-1.5 font-mono text-[10px] whitespace-pre-wrap break-all overflow-x-auto max-h-32">
+          {JSON.stringify(input, null, 2)}
+        </pre>
+      )}
+
+      {error && (
+        <div className="mb-2 text-[11px] text-red-500">{error}</div>
+      )}
+
+      <div className="flex flex-wrap gap-1.5">
+        <button
+          type="button"
+          onClick={() => handle("approve")}
+          disabled={resolving !== null}
+          className="px-2.5 py-1 text-xs font-medium rounded bg-green-700 text-white hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {resolving === "approve" ? "Approving…" : "Approve"}
+        </button>
+        <button
+          type="button"
+          onClick={() => handle("approve-always")}
+          disabled={resolving !== null}
+          title="Approve and don't ask again for similar calls in this thread"
+          className="px-2.5 py-1 text-xs font-medium rounded border border-green-700/50 text-green-700 dark:text-green-400 hover:bg-green-700/10 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {resolving === "approve-always" ? "Saving rule…" : "Approve always"}
+        </button>
+        <button
+          type="button"
+          onClick={() => handle("reject")}
+          disabled={resolving !== null}
+          className="px-2.5 py-1 text-xs font-medium rounded bg-red-700/90 text-white hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {resolving === "reject" ? "Rejecting…" : "Reject"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function StreamingMessage({
   segments,
   streamingText,
   streamingThinking,
   streamingError,
+  streamingStatus,
+  streamElapsedMs,
   isActive,
+  pendingApprovals,
+  onResolveApproval,
 }: {
   segments: ChatSegment[];
   streamingText: string;
   streamingThinking: string;
   streamingError: string;
+  /** Latest human-readable status ("Running Bash", "Calling X", etc). */
+  streamingStatus?: string | null;
+  /** Milliseconds elapsed since the current turn started. */
+  streamElapsedMs?: number;
   isActive: boolean;
+  /** Tool calls waiting for board approval, rendered inline. */
+  pendingApprovals?: PendingApprovalUI[];
+  onResolveApproval?: (
+    approvalId: string,
+    decision: "approve" | "reject",
+    decisionNote?: string,
+  ) => Promise<void>;
 }) {
   const allSegments: ChatSegment[] = [...segments];
   if (streamingThinking) {
@@ -543,7 +678,12 @@ function StreamingMessage({
           {!hasAnyContent && isActive && (
             <div className="flex items-center gap-2 text-muted-foreground">
               <span className="inline-block" style={{ animation: "spin 1s linear infinite" }}>&#x27F3;</span>
-              <span className="text-xs">Thinking&#x2026;</span>
+              <span className="text-xs">
+                {streamingStatus ?? "Thinking"}
+                {typeof streamElapsedMs === "number" && streamElapsedMs >= 2000
+                  ? ` · ${Math.round(streamElapsedMs / 1000)}s`
+                  : "\u2026"}
+              </span>
             </div>
           )}
 
@@ -573,6 +713,37 @@ function StreamingMessage({
             <div className="chat-msg-enter my-1.5 py-2 px-3 rounded-md bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.15)] text-[13px] text-[#ef4444] flex items-start gap-2">
               <span className="shrink-0 mt-px text-xs">!</span>
               <span className="whitespace-pre-wrap">{streamingError}</span>
+            </div>
+          )}
+          {/* Inline approval cards — rendered when Claude wants to run a
+              mutation and canUseTool is waiting on a board decision. */}
+          {pendingApprovals && pendingApprovals.length > 0 && onResolveApproval && (
+            <div className="mt-2 space-y-2">
+              {pendingApprovals.map((pa) => (
+                <InlineApprovalCard
+                  key={pa.approvalId}
+                  approval={pa}
+                  onResolve={onResolveApproval}
+                />
+              ))}
+            </div>
+          )}
+          {/* Trailing status line — visible even when content is present,
+               so long tool runs keep the user informed. */}
+          {hasAnyContent && isActive && streamingStatus && (
+            <div className="flex items-center gap-2 mt-1.5 text-muted-foreground">
+              <span
+                className="inline-block"
+                style={{ animation: "spin 1s linear infinite" }}
+              >
+                &#x27F3;
+              </span>
+              <span className="text-[11px]">
+                {streamingStatus}
+                {typeof streamElapsedMs === "number" && streamElapsedMs >= 2000
+                  ? ` · ${Math.round(streamElapsedMs / 1000)}s`
+                  : "\u2026"}
+              </span>
             </div>
           )}
         </div>
@@ -808,7 +979,18 @@ export function ChatPage(_props: PluginPageProps) {
   const availableHeight = useAvailableHeight(containerRef, { bottomPadding: 24, minHeight: 384 });
 
   // Thread state
-  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(() => {
+    // Deep-link support: if the page was opened with ?threadId=<id>,
+    // auto-select that thread so approval cards can link back here
+    // from the board inbox.
+    if (typeof window === "undefined") return null;
+    try {
+      const p = new URLSearchParams(window.location.search);
+      return p.get("threadId");
+    } catch {
+      return null;
+    }
+  });
   const [selectedAdapter, setSelectedAdapter] = useState("claude_local");
   const [selectedModel, setSelectedModel] = useState("");
   const [input, setInput] = useState("");
@@ -817,6 +999,59 @@ export function ChatPage(_props: PluginPageProps) {
   const [editingTitle, setEditingTitle] = useState("");
   const [streamingText, setStreamingText] = useState("");
   const [streamingThinking, setStreamingThinking] = useState("");
+  // Live tool segments received during streaming (before the final
+  // persisted message arrives). Rendered alongside text/thinking so the
+  // user sees the tool pill the instant Claude calls a tool.
+  const [streamingTools, setStreamingTools] = useState<ChatSegment[]>([]);
+  // Human-readable status displayed next to the spinner: "Thinking",
+  // "Running Bash", "Calling create-linear-issue", "Awaiting approval".
+  const [streamingStatus, setStreamingStatus] = useState<string | null>(null);
+  // Pending tool approvals — rendered as inline cards in the chat so
+  // the user never has to leave the conversation to approve a tool call.
+  // Removed when the matching tool_use event arrives (= the chat worker's
+  // canUseTool poller saw the central approval flip to approved/rejected
+  // and either ran the tool or aborted it).
+  interface PendingApproval {
+    approvalId: string;
+    name: string;
+    input: unknown;
+    requestedAt: number;
+  }
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
+  const resolveBoardApproval = usePluginAction("resolveBoardApproval");
+
+  // Hydrate pending approvals from the central approvals API on every
+  // thread switch / mount so the inline cards survive navigating away
+  // and back. `refetch` is re-invoked below on `done` and periodically
+  // so background-agent-initiated approvals also show up.
+  const pendingApprovalsParams = useMemo(
+    () => ({
+      companyId: companyId ?? "",
+      threadId: selectedThreadId ?? "",
+    }),
+    [companyId, selectedThreadId],
+  );
+  const { data: hydratedPendingApprovals, refresh: refetchPendingApprovals } =
+    usePluginData<PendingApproval[]>("pendingApprovals", pendingApprovalsParams);
+
+  // Merge hydrated list with the stream-event-pushed list on each
+  // fetch. Dedupe by approvalId so duplicates from "add then rehydrate"
+  // don't render twice.
+  useEffect(() => {
+    if (!hydratedPendingApprovals) return;
+    setPendingApprovals((prev) => {
+      const byId = new Map<string, PendingApproval>();
+      for (const pa of hydratedPendingApprovals) byId.set(pa.approvalId, pa);
+      // Keep any locally-pushed ones that the server hasn't returned yet
+      // (race: stream event arrived before the approval is queryable).
+      for (const pa of prev) {
+        if (!byId.has(pa.approvalId)) byId.set(pa.approvalId, pa);
+      }
+      return Array.from(byId.values()).sort(
+        (a, b) => a.requestedAt - b.requestedAt,
+      );
+    });
+  }, [hydratedPendingApprovals]);
   const [streamingError, setStreamingError] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -877,7 +1112,11 @@ export function ChatPage(_props: PluginPageProps) {
     : [];
   const showSlashMenu = slashQuery !== null && filteredCommands.length > 0 && !isStreaming;
 
-  // Process stream events
+  // Process stream events. We render tool_use / tool_result in the
+  // live streaming view as first-class segments (not just on completion)
+  // so the user sees exactly what the agent is doing right now. A
+  // status line updates on every SDK event so "Thinking..." becomes
+  // "Running Bash", "Calling create-linear-issue", etc.
   const lastProcessedCount = useRef(0);
   useEffect(() => {
     if (streamEvents.length <= lastProcessedCount.current) return;
@@ -888,13 +1127,87 @@ export function ChatPage(_props: PluginPageProps) {
     for (const evt of newEvents) {
       if (evt.type === "text" && evt.text) {
         setStreamingText((prev) => prev + evt.text);
+        setStreamingStatus(null);
       }
       if (evt.type === "thinking" && evt.text) {
         setStreamingThinking((prev) => prev + evt.text);
+        setStreamingStatus("Thinking");
+      }
+      if (evt.type === "tool_use") {
+        const toolName = evt.name ?? "tool";
+        const shortName = toolName.startsWith("mcp__")
+          ? toolName.split("__").pop() ?? toolName
+          : toolName;
+        setStreamingTools((prev) => [
+          ...prev,
+          {
+            kind: "tool",
+            name: toolName,
+            input: evt.input,
+            result: undefined,
+          },
+        ]);
+        // The tool actually ran, which means any pending approval for
+        // this tool was resolved (approved). Drop it from the inline
+        // card list so the UI doesn't keep showing it as pending.
+        setPendingApprovals((prev) =>
+          prev.filter((p) => p.name !== toolName),
+        );
+        // Label the live status with the tool being called so the user
+        // sees "Running Bash" / "Calling paperclip-create-issue" etc.
+        const verb = toolName === "Bash" ? "Running"
+          : toolName === "Read" || toolName === "Glob" || toolName === "Grep" ? "Searching"
+          : toolName === "Write" || toolName === "Edit" ? "Editing"
+          : toolName === "WebSearch" || toolName === "WebFetch" ? "Fetching"
+          : "Calling";
+        setStreamingStatus(`${verb} ${shortName}`);
+      }
+      if (evt.type === "tool_result") {
+        setStreamingTools((prev) => {
+          // Attach the result to the most recent pending tool segment.
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i--) {
+            const seg = next[i];
+            if (seg && seg.kind === "tool" && seg.result === undefined) {
+              next[i] = {
+                ...seg,
+                result: evt.content ?? "",
+                isError: evt.isError ?? false,
+              };
+              break;
+            }
+          }
+          return next;
+        });
+        setStreamingStatus("Thinking");
+      }
+      if (evt.type === "permission_request") {
+        const name = evt.name ?? "tool";
+        const approvalId = evt.approvalId;
+        const short = name.startsWith("mcp__")
+          ? name.split("__").pop() ?? name
+          : name;
+        setStreamingStatus(`Awaiting your approval for ${short}`);
+        if (approvalId) {
+          setPendingApprovals((prev) => {
+            // Dedupe by approvalId in case the event arrives twice.
+            if (prev.some((p) => p.approvalId === approvalId)) return prev;
+            return [
+              ...prev,
+              {
+                approvalId,
+                name,
+                input: evt.input,
+                requestedAt: Date.now(),
+              },
+            ];
+          });
+        }
       }
       if (evt.type === "error" && evt.text) {
         const errText = evt.text;
         setStreamingError((prev) => prev ? prev + "\n" + errText : errText);
+        setStreamingStatus(null);
       }
       if (evt.type === "title_updated") {
         refreshThreads();
@@ -902,13 +1215,36 @@ export function ChatPage(_props: PluginPageProps) {
       if (evt.type === "done") {
         refreshMessages();
         refreshThreads();
+        // Re-hydrate pending approvals from the central API — any that
+        // landed late in this turn (including from background agents)
+        // will show up. We don't clear pendingApprovals locally; the
+        // refetch reconciles.
+        refetchPendingApprovals();
         setStreamingText("");
         setStreamingThinking("");
+        setStreamingTools([]);
+        setStreamingStatus(null);
         setStreamingError("");
         lastProcessedCount.current = 0;
       }
     }
   }, [streamEvents, refreshMessages, refreshThreads]);
+
+  // Ticker for "Thinking... (2s)" elapsed time display. Starts when
+  // isStreaming transitions to true, resets otherwise.
+  const [streamElapsedMs, setStreamElapsedMs] = useState(0);
+  useEffect(() => {
+    if (!isStreaming) {
+      setStreamElapsedMs(0);
+      return;
+    }
+    const startedAt = Date.now();
+    setStreamElapsedMs(0);
+    const id = setInterval(() => {
+      setStreamElapsedMs(Date.now() - startedAt);
+    }, 500);
+    return () => clearInterval(id);
+  }, [isStreaming]);
 
   // Auto-scroll
   useEffect(() => {
@@ -930,10 +1266,14 @@ export function ChatPage(_props: PluginPageProps) {
     }
   }, [currentModels, selectedModel]);
 
-  // Reset streaming on thread switch
+  // Reset streaming on thread switch. Don't clear pendingApprovals —
+  // the usePluginData effect above will re-hydrate from the central
+  // API for the newly-selected thread.
   useEffect(() => {
     setStreamingText("");
     setStreamingThinking("");
+    setStreamingTools([]);
+    setStreamingStatus(null);
     setStreamingError("");
     lastProcessedCount.current = 0;
   }, [selectedThreadId]);
@@ -982,6 +1322,9 @@ export function ChatPage(_props: PluginPageProps) {
     setInput("");
     setStreamingText("");
     setStreamingThinking("");
+    setStreamingTools([]);
+    setPendingApprovals([]);
+    setStreamingStatus(null);
     setStreamingError("");
     lastProcessedCount.current = 0;
 
@@ -1009,6 +1352,9 @@ export function ChatPage(_props: PluginPageProps) {
     refreshThreads();
     setStreamingText("");
     setStreamingThinking("");
+    setStreamingTools([]);
+    setPendingApprovals([]);
+    setStreamingStatus(null);
     setStreamingError("");
   }, [selectedThreadId, companyId, stopThread, refreshThreads]);
 
@@ -1027,6 +1373,9 @@ export function ChatPage(_props: PluginPageProps) {
     setSending(true);
     setStreamingText("");
     setStreamingThinking("");
+    setStreamingTools([]);
+    setPendingApprovals([]);
+    setStreamingStatus(null);
     setStreamingError("");
     lastProcessedCount.current = 0;
     setTimeout(() => { refreshMessages(); refreshThreads(); }, 300);
@@ -1051,6 +1400,9 @@ export function ChatPage(_props: PluginPageProps) {
     setSending(true);
     setStreamingText("");
     setStreamingThinking("");
+    setStreamingTools([]);
+    setPendingApprovals([]);
+    setStreamingStatus(null);
     setStreamingError("");
     lastProcessedCount.current = 0;
     setTimeout(() => { refreshMessages(); refreshThreads(); }, 300);
@@ -1309,11 +1661,27 @@ export function ChatPage(_props: PluginPageProps) {
           {/* Live streaming message */}
           {selectedThreadId && isStreaming && (
             <StreamingMessage
-              segments={[]}
+              segments={streamingTools}
               streamingText={streamingText}
               streamingThinking={streamingThinking}
               streamingError={streamingError}
+              streamingStatus={streamingStatus}
+              streamElapsedMs={streamElapsedMs}
               isActive={true}
+              pendingApprovals={pendingApprovals}
+              onResolveApproval={async (approvalId, decision, decisionNote) => {
+                await resolveBoardApproval({
+                  approvalId,
+                  decision,
+                  decisionNote,
+                });
+                // Optimistically drop the card — the chat worker's
+                // poller will confirm within ~1.5s and either run the
+                // tool or report the denial.
+                setPendingApprovals((prev) =>
+                  prev.filter((p) => p.approvalId !== approvalId),
+                );
+              }}
             />
           )}
 
