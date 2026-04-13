@@ -10,6 +10,7 @@ import type {
   ChatAdapterInfo,
   ChatStreamEvent,
 } from "../types.js";
+import { isResearchTool, renderResearchCard } from "./research-cards.js";
 
 // ---------------------------------------------------------------------------
 // SVG Icons — match core chat UI icons
@@ -341,6 +342,24 @@ function ThinkingBlock({ content, isLive }: { content: string; isLive: boolean }
 function ToolCallDetail({ seg, isLive }: { seg: Extract<ChatSegment, { kind: "tool" }>; isLive: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const hasResult = seg.result !== undefined;
+
+  // Render rich cards for research tools
+  const isRich = hasResult && !seg.isError && isResearchTool(seg.name);
+  const richCard = isRich && seg.result ? renderResearchCard(seg.name, seg.result) : null;
+
+  if (richCard) {
+    // Rich card: auto-expanded, no collapsible wrapper for the card itself
+    return (
+      <div className="my-1">
+        <div className="flex items-center gap-1 text-[11px] text-muted-foreground py-0.5 font-mono opacity-70">
+          <span className="text-[#22c55e] text-[10px]">{"\u2713"}</span>
+          <span>{seg.name}</span>
+        </div>
+        <div className="ml-0 mt-1 font-sans">{richCard}</div>
+      </div>
+    );
+  }
+
   return (
     <div className="my-0.5">
       <button
