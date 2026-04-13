@@ -1044,6 +1044,7 @@ export function ChatPage(_props: PluginPageProps) {
   const hostAny = hostCtx as unknown as Record<string, unknown>;
   const workspaceCwd = (typeof hostAny.workspaceCwd === "string" ? hostAny.workspaceCwd : null);
   const workspaceLabel = (typeof hostAny.workspaceLabel === "string" ? hostAny.workspaceLabel : null);
+  const workspaceBranch = (typeof hostAny.workspaceBranch === "string" ? hostAny.workspaceBranch : null);
 
   // Container ref for useAvailableHeight
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1661,33 +1662,31 @@ export function ChatPage(_props: PluginPageProps) {
       {/* ── Main area ── */}
       <div className="flex-1 flex flex-col min-w-0">
 
-        {/* ── Context bar: workspace badge + thinking toggle ── */}
-        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0 min-h-[32px]">
+        {/* ── Compact toolbar: sidebar toggle + workspace chip + thinking ── */}
+        <div className="flex items-center gap-1.5 px-2 py-1 shrink-0">
           <button
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            className="bg-transparent border-none cursor-pointer text-muted-foreground p-0.5 flex items-center opacity-40 hover:opacity-80"
+            className="bg-transparent border-none cursor-pointer text-muted-foreground/40 p-0.5 flex items-center hover:text-muted-foreground/70"
             title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
           >
-            <IconSidebar size={14} />
+            <IconSidebar size={13} />
           </button>
-          {workspaceCwd && (
-            <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono truncate">
-              <span className="opacity-40">cwd:</span>
-              <span className="truncate opacity-60" title={workspaceCwd}>{workspaceCwd.replace(/^\/Users\/[^/]+/, "~")}</span>
-              {workspaceLabel && <span className="opacity-30">({workspaceLabel})</span>}
-            </div>
+          {workspaceBranch && (
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-accent/60 text-muted-foreground/70 truncate max-w-[180px]" title={`${workspaceBranch} · ${workspaceCwd}`}>
+              {workspaceBranch}
+            </span>
           )}
-          <div className="ml-auto flex items-center gap-1.5">
+          <div className="ml-auto flex items-center">
             <button
               onClick={toggleThinking}
-              className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
+              className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
                 showThinking
-                  ? "border-foreground/20 text-foreground/70 bg-accent"
-                  : "border-transparent text-muted-foreground/40 hover:text-muted-foreground/60"
+                  ? "text-foreground/60 bg-accent/60"
+                  : "text-muted-foreground/30 hover:text-muted-foreground/50"
               }`}
               title={showThinking ? "Hide thinking blocks" : "Show thinking blocks"}
             >
-              {showThinking ? "Thinking: On" : "Thinking: Off"}
+              {showThinking ? "Thinking" : "Thinking"}
             </button>
           </div>
         </div>
