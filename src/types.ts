@@ -21,6 +21,10 @@ export interface ChatThread {
    * approval requests.
    */
   allowedTools?: string[];
+  /** Workspace cwd this thread is scoped to (set from host context, overrideable per-message). */
+  workspaceCwd?: string | null;
+  /** Human-readable workspace label for display. */
+  workspaceLabel?: string | null;
 }
 
 /** A single chat message */
@@ -76,4 +80,6 @@ export interface ChatStreamEvent {
   title?: string;
   /** Board-approval request — `approvalId` identifies the pending record */
   approvalId?: string;
+  /** Whether the error is retryable (transient network/rate-limit vs permanent). */
+  retryable?: boolean;
 }

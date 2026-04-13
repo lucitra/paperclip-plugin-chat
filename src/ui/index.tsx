@@ -11,6 +11,15 @@ import type {
   ChatStreamEvent,
 } from "../types.js";
 import { isResearchTool, renderResearchCard } from "./research-cards.js";
+import {
+  displayToolName,
+  summarizeToolInput,
+  describeToolInput,
+  summarizeToolResult,
+  formatToolPayload,
+  isPluginTool,
+  getPluginKey,
+} from "./transcript-presentation.js";
 
 // ---------------------------------------------------------------------------
 // SVG Icons — match core chat UI icons
@@ -305,7 +314,10 @@ function summarizeTools(segments: ChatSegment[]): string {
   if (tools.length === 0) return "Thinking";
   const counts = new Map<string, number>();
   for (const t of tools) {
-    if (t.kind === "tool") counts.set(t.name, (counts.get(t.name) ?? 0) + 1);
+    if (t.kind === "tool") {
+      const label = displayToolName(t.name, t.input);
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
   }
   const parts: string[] = [];
   for (const [name, count] of counts) {
@@ -342,18 +354,21 @@ function ThinkingBlock({ content, isLive }: { content: string; isLive: boolean }
 function ToolCallDetail({ seg, isLive }: { seg: Extract<ChatSegment, { kind: "tool" }>; isLive: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const hasResult = seg.result !== undefined;
+  const toolLabel = displayToolName(seg.name, seg.input);
+  const pluginKey = getPluginKey(seg.name);
+  const inputSummary = seg.input != null ? summarizeToolInput(seg.name, seg.input) : null;
 
   // Render rich cards for research tools
   const isRich = hasResult && !seg.isError && isResearchTool(seg.name);
   const richCard = isRich && seg.result ? renderResearchCard(seg.name, seg.result) : null;
 
   if (richCard) {
-    // Rich card: auto-expanded, no collapsible wrapper for the card itself
     return (
       <div className="my-1">
-        <div className="flex items-center gap-1 text-[11px] text-muted-foreground py-0.5 font-mono opacity-70">
+        <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground py-0.5 opacity-70">
           <span className="text-[#22c55e] text-[10px]">{"\u2713"}</span>
-          <span>{seg.name}</span>
+          <span className="font-medium">{toolLabel}</span>
+          {pluginKey && <span className="text-[9px] px-1 py-0.5 rounded bg-accent/50">{pluginKey.replace("paperclip-plugin-", "")}</span>}
         </div>
         <div className="ml-0 mt-1 font-sans">{richCard}</div>
       </div>
@@ -364,23 +379,40 @@ function ToolCallDetail({ seg, isLive }: { seg: Extract<ChatSegment, { kind: "to
     <div className="my-0.5">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-1 text-[11px] text-muted-foreground bg-transparent border-none cursor-pointer py-0.5 px-0 font-mono opacity-70"
+        className="flex items-center gap-1.5 text-[11px] text-muted-foreground bg-transparent border-none cursor-pointer py-0.5 px-0 opacity-70 max-w-full"
       >
-        <span className="text-[9px]">{expanded ? "\u25BC" : "\u25B6"}</span>
-        <span>{seg.name}</span>
-        {!hasResult && isLive && <span className="chat-tool-pulse text-[#f59e0b] text-[8px]">{"\u25CF"}</span>}
-        {hasResult && seg.isError && <span className="text-[#ef4444] text-[10px]">{"\u2715"}</span>}
-        {hasResult && !seg.isError && <span className="text-[#22c55e] text-[10px]">{"\u2713"}</span>}
+        <span className="text-[9px] shrink-0">{expanded ? "\u25BC" : "\u25B6"}</span>
+        <span className="font-medium shrink-0">{toolLabel}</span>
+        {pluginKey && <span className="text-[9px] px-1 py-0.5 rounded bg-accent/50 shrink-0">{pluginKey.replace("paperclip-plugin-", "")}</span>}
+        {!expanded && inputSummary && <span className="truncate text-muted-foreground/50 font-mono text-[10px]">{inputSummary}</span>}
+        {!hasResult && isLive && <span className="chat-tool-pulse text-[#f59e0b] text-[8px] shrink-0">{"\u25CF"}</span>}
+        {hasResult && seg.isError && <span className="text-[#ef4444] text-[10px] shrink-0">{"\u2715"}</span>}
+        {hasResult && !seg.isError && <span className="text-[#22c55e] text-[10px] shrink-0">{"\u2713"}</span>}
       </button>
       {expanded && (
-        <div className="ml-4 text-[11px] font-mono">
+        <div className="ml-4 text-[11px]">
           {seg.input != null && (
-            <div className="p-1 px-2 bg-[rgba(0,0,0,0.06)] rounded-sm mb-1 max-h-[100px] overflow-auto text-muted-foreground">
-              {typeof seg.input === "string" ? seg.input : JSON.stringify(seg.input, null, 2)}
+            <div className="p-1.5 px-2 bg-[rgba(0,0,0,0.06)] rounded-sm mb-1 max-h-[120px] overflow-auto text-muted-foreground">
+              {(() => {
+                const details = describeToolInput(seg.name, seg.input);
+                if (details.length > 0) {
+                  return (
+                    <div className="flex flex-col gap-0.5">
+                      {details.map((d, i) => (
+                        <div key={i} className="flex gap-2">
+                          <span className="text-muted-foreground/60 shrink-0">{d.label}:</span>
+                          <span className={d.tone === "code" ? "font-mono" : ""}>{d.value}</span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                }
+                return <pre className="whitespace-pre-wrap font-mono text-[10px]">{formatToolPayload(seg.input)}</pre>;
+              })()}
             </div>
           )}
           {seg.result && (
-            <div className={`p-1 px-2 rounded-sm max-h-[120px] overflow-auto ${seg.isError ? "bg-[rgba(239,68,68,0.08)] text-[#ef4444]" : "bg-[rgba(0,0,0,0.04)] text-muted-foreground"}`}>
+            <div className={`p-1.5 px-2 rounded-sm max-h-[140px] overflow-auto font-mono text-[10px] ${seg.isError ? "bg-[rgba(239,68,68,0.08)] text-[#ef4444]" : "bg-[rgba(0,0,0,0.04)] text-muted-foreground"}`}>
               {seg.result}
             </div>
           )}
@@ -410,7 +442,7 @@ function ActivityGroup({ segments, isLive }: { segments: ChatSegment[]; isLive: 
         <span className="text-[9px]">{expanded ? "\u25BC" : "\u25B6"}</span>
         {isLive && activeTool && activeTool.kind === "tool" ? (
           <span>
-            Running <span className="font-mono">{activeTool.name}</span>
+            Running <span className="font-medium">{displayToolName(activeTool.name, activeTool.input)}</span>
             {toolCount > 1 && <span className="opacity-60">{" \u00B7 "}{toolCount} tools</span>}
           </span>
         ) : (
@@ -528,9 +560,7 @@ interface PendingApprovalUI {
 
 /** Pretty-print the short name of a tool for UI display. */
 function shortToolName(fullName: string): string {
-  if (!fullName.startsWith("mcp__")) return fullName;
-  const parts = fullName.split("__").filter(Boolean);
-  return parts[parts.length - 1] ?? fullName;
+  return displayToolName(fullName);
 }
 
 /**
@@ -647,8 +677,10 @@ function StreamingMessage({
   streamingStatus,
   streamElapsedMs,
   isActive,
+  showThinking,
   pendingApprovals,
   onResolveApproval,
+  onRetry,
 }: {
   segments: ChatSegment[];
   streamingText: string;
@@ -659,6 +691,8 @@ function StreamingMessage({
   /** Milliseconds elapsed since the current turn started. */
   streamElapsedMs?: number;
   isActive: boolean;
+  /** Whether to show thinking blocks (session-level toggle). */
+  showThinking?: boolean;
   /** Tool calls waiting for board approval, rendered inline. */
   pendingApprovals?: PendingApprovalUI[];
   onResolveApproval?: (
@@ -666,9 +700,11 @@ function StreamingMessage({
     decision: "approve" | "reject",
     decisionNote?: string,
   ) => Promise<void>;
+  /** Retry callback for failed messages. */
+  onRetry?: () => void;
 }) {
   const allSegments: ChatSegment[] = [...segments];
-  if (streamingThinking) {
+  if (streamingThinking && showThinking !== false) {
     allSegments.push({ kind: "thinking", content: streamingThinking });
   }
   if (streamingText) {
@@ -729,9 +765,19 @@ function StreamingMessage({
             return null;
           })}
           {streamingError && (
-            <div className="chat-msg-enter my-1.5 py-2 px-3 rounded-md bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.15)] text-[13px] text-[#ef4444] flex items-start gap-2">
-              <span className="shrink-0 mt-px text-xs">!</span>
-              <span className="whitespace-pre-wrap">{streamingError}</span>
+            <div className="chat-msg-enter my-1.5 py-2 px-3 rounded-md bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.15)] text-[13px] text-[#ef4444]">
+              <div className="flex items-start gap-2">
+                <span className="shrink-0 mt-px text-xs">!</span>
+                <span className="whitespace-pre-wrap flex-1">{streamingError}</span>
+              </div>
+              {onRetry && (
+                <button
+                  onClick={onRetry}
+                  className="mt-2 px-3 py-1 text-xs font-medium rounded bg-[rgba(239,68,68,0.15)] text-[#ef4444] hover:bg-[rgba(239,68,68,0.25)] transition-colors"
+                >
+                  Retry
+                </button>
+              )}
             </div>
           )}
           {/* Inline approval cards — rendered when Claude wants to run a
@@ -991,7 +1037,13 @@ function ChatInput({
 // ---------------------------------------------------------------------------
 
 export function ChatPage(_props: PluginPageProps) {
-  const { companyId } = useHostContext();
+  const hostCtx = useHostContext();
+  const companyId = hostCtx.companyId;
+  // workspaceCwd and workspaceLabel are Lucitra additions to PluginHostContext
+  // — not in the upstream SDK type, so we access via unknown cast.
+  const hostAny = hostCtx as unknown as Record<string, unknown>;
+  const workspaceCwd = (typeof hostAny.workspaceCwd === "string" ? hostAny.workspaceCwd : null);
+  const workspaceLabel = (typeof hostAny.workspaceLabel === "string" ? hostAny.workspaceLabel : null);
 
   // Container ref for useAvailableHeight
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1077,6 +1129,20 @@ export function ChatPage(_props: PluginPageProps) {
   const [slashMenuIndex, setSlashMenuIndex] = useState(0);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Thinking toggle — persisted to localStorage
+  const [showThinking, setShowThinking] = useState(() => {
+    try { return localStorage.getItem("paperclip-chat.showThinking") === "true"; } catch { return false; }
+  });
+  const toggleThinking = useCallback(() => {
+    setShowThinking(prev => {
+      const next = !prev;
+      try { localStorage.setItem("paperclip-chat.showThinking", String(next)); } catch {}
+      return next;
+    });
+  }, []);
+  // Track last sent message for retry
+  const [lastSentMessage, setLastSentMessage] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
 
   const adjustTextareaHeight = useCallback(() => {
     const ta = textareaRef.current;
@@ -1350,11 +1416,15 @@ export function ChatPage(_props: PluginPageProps) {
     // Refresh early so the user message appears while the agent is working
     setTimeout(() => { refreshMessages(); refreshThreads(); }, 300);
 
+    setLastSentMessage(trimmed);
+    setRetryCount(0);
+
     try {
       await sendMessage({
         threadId,
         message: trimmed,
         companyId,
+        ...(workspaceCwd ? { cwd: workspaceCwd, workspaceLabel } : {}),
       });
     } catch (err) {
       console.error("Send failed:", err);
@@ -1591,16 +1661,39 @@ export function ChatPage(_props: PluginPageProps) {
       {/* ── Main area ── */}
       <div className="flex-1 flex flex-col min-w-0">
 
-        {/* ── Messages area ── */}
-        <div className="chat-scroll flex-1 overflow-auto px-8 relative">
-          {/* Sidebar toggle */}
+        {/* ── Context bar: workspace badge + thinking toggle ── */}
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0 min-h-[32px]">
           <button
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            className="sticky top-2 left-0 z-10 bg-transparent border-none cursor-pointer text-muted-foreground p-1 flex items-center opacity-40 -mb-7"
+            className="bg-transparent border-none cursor-pointer text-muted-foreground p-0.5 flex items-center opacity-40 hover:opacity-80"
             title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
           >
-            <IconSidebar size={16} />
+            <IconSidebar size={14} />
           </button>
+          {workspaceCwd && (
+            <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono truncate">
+              <span className="opacity-40">cwd:</span>
+              <span className="truncate opacity-60" title={workspaceCwd}>{workspaceCwd.replace(/^\/Users\/[^/]+/, "~")}</span>
+              {workspaceLabel && <span className="opacity-30">({workspaceLabel})</span>}
+            </div>
+          )}
+          <div className="ml-auto flex items-center gap-1.5">
+            <button
+              onClick={toggleThinking}
+              className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
+                showThinking
+                  ? "border-foreground/20 text-foreground/70 bg-accent"
+                  : "border-transparent text-muted-foreground/40 hover:text-muted-foreground/60"
+              }`}
+              title={showThinking ? "Hide thinking blocks" : "Show thinking blocks"}
+            >
+              {showThinking ? "Thinking: On" : "Thinking: Off"}
+            </button>
+          </div>
+        </div>
+
+        {/* ── Messages area ── */}
+        <div className="chat-scroll flex-1 overflow-auto px-8 relative">
           {/* Welcome screen */}
           {!selectedThreadId && (
             <div className="flex flex-col items-center justify-center h-full gap-5 px-6">
@@ -1687,6 +1780,7 @@ export function ChatPage(_props: PluginPageProps) {
               streamingStatus={streamingStatus}
               streamElapsedMs={streamElapsedMs}
               isActive={true}
+              showThinking={showThinking}
               pendingApprovals={pendingApprovals}
               onResolveApproval={async (approvalId, decision, decisionNote) => {
                 await resolveBoardApproval({
@@ -1694,13 +1788,29 @@ export function ChatPage(_props: PluginPageProps) {
                   decision,
                   decisionNote,
                 });
-                // Optimistically drop the card — the chat worker's
-                // poller will confirm within ~1.5s and either run the
-                // tool or report the denial.
                 setPendingApprovals((prev) =>
                   prev.filter((p) => p.approvalId !== approvalId),
                 );
               }}
+              onRetry={lastSentMessage && retryCount < 3 ? async () => {
+                if (!lastSentMessage || !selectedThreadId) return;
+                setRetryCount(prev => prev + 1);
+                setStreamingError("");
+                setSending(true);
+                try {
+                  await sendMessage({
+                    threadId: selectedThreadId,
+                    message: lastSentMessage,
+                    companyId,
+                    ...(workspaceCwd ? { cwd: workspaceCwd, workspaceLabel } : {}),
+                  });
+                } catch (err) {
+                  console.error("Retry failed:", err);
+                } finally {
+                  setSending(false);
+                  refreshMessages();
+                }
+              } : undefined}
             />
           )}
 

@@ -414,12 +414,20 @@ const plugin = definePlugin({
       const threadId = params.threadId as string;
       const message = params.message as string;
       const companyId = params.companyId as string;
+      const explicitCwd = (params.cwd as string | undefined) ?? null;
+      const workspaceLabel = (params.workspaceLabel as string | undefined) ?? null;
       if (!threadId || !message || !companyId) {
         throw new Error("threadId, message, and companyId required");
       }
 
       const thread = await getThread(ctx, threadId);
       if (!thread) throw new Error("Thread not found");
+
+      // Persist workspace context on the thread if provided
+      if (explicitCwd) {
+        thread.workspaceCwd = explicitCwd;
+        if (workspaceLabel) thread.workspaceLabel = workspaceLabel;
+      }
 
       // Save user message
       const msgs = await getMessages(ctx, threadId);
@@ -498,14 +506,17 @@ const plugin = definePlugin({
               }).join("\n")
             : "No projects";
 
-          // Find primary workspace cwd for Claude's working directory
-          const primaryProject = allProjects.find(p => {
-            const ws = (p as Record<string, unknown>).primaryWorkspace as Record<string, unknown> | null;
-            return ws?.cwd;
-          });
-          const workspaceCwd = primaryProject
-            ? ((primaryProject as Record<string, unknown>).primaryWorkspace as Record<string, unknown>)?.cwd as string | undefined
-            : undefined;
+          // Resolve workspace cwd: explicit from UI > thread-stored > auto-discovered primary
+          const autoDiscoveredCwd = (() => {
+            const primaryProject = allProjects.find(p => {
+              const ws = (p as Record<string, unknown>).primaryWorkspace as Record<string, unknown> | null;
+              return ws?.cwd;
+            });
+            return primaryProject
+              ? ((primaryProject as Record<string, unknown>).primaryWorkspace as Record<string, unknown>)?.cwd as string | undefined
+              : undefined;
+          })();
+          const workspaceCwd = explicitCwd ?? thread.workspaceCwd ?? autoDiscoveredCwd;
 
           // Find CEO agent for JWT minting (auth middleware requires real agent ID)
           const ceoAgent = allAgents.find(a => a.role === "ceo")
@@ -520,6 +531,37 @@ const plugin = definePlugin({
           // Company name for persona
           const companyName = (company as Record<string, unknown> | null)?.name as string | undefined ?? "this company";
 
+          // Pre-fetch available plugin tools so the LLM knows what's available
+          let pluginToolCatalog = "";
+          try {
+            const toolsRes = await fetch(`${paperclipApiUrl}/api/plugins/tools`, {
+              headers: {
+                ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+                "x-company-id": companyId,
+              },
+            });
+            if (toolsRes.ok) {
+              const tools = (await toolsRes.json()) as Array<{ name: string; description?: string; pluginId?: string }>;
+              if (tools.length > 0) {
+                pluginToolCatalog = [
+                  "",
+                  "### Available plugin tools (via `mcp__paperclip__*`)",
+                  "",
+                  ...tools.map(t => `- **${t.name}**: ${t.description ?? "no description"}`),
+                  "",
+                ].join("\n");
+              }
+            }
+          } catch {
+            // Non-fatal — tools still discoverable via MCP at runtime
+          }
+
+          // Workspace display info
+          const wsLabel = workspaceLabel ?? thread.workspaceLabel ?? null;
+          const wsInfo = workspaceCwd
+            ? `Workspace: \`${workspaceCwd}\`${wsLabel ? ` (${wsLabel})` : ""}`
+            : "";
+
           // Terse companion context — NOT a persona override. Claude Code
           // behaves like itself; this just tells it which company/workspace
           // it's looking at and what Paperclip-specific MCP tools are
@@ -530,9 +572,10 @@ const plugin = definePlugin({
             `You are running inside a Paperclip chat session for ${companyName} (company ID: \`${companyId}\`).`,
             `Paperclip API: ${paperclipApiUrl}`,
             `Agents: ${allAgents.length} · Issues: ${allIssues.length} · Projects: ${allProjects.length}`,
-            workspaceCwd ? `Primary workspace cwd: \`${workspaceCwd}\`` : "",
+            wsInfo,
             "",
-            "Paperclip-specific MCP tools are available under the `mcp__paperclip__*` namespace for Linear, Kalshi, and any other plugin in the host. Use them when the user asks about agents, tasks, projects, tickets, or trading data. Otherwise behave exactly as you would in a normal Claude Code session — read/edit files, run shell commands, search the web, etc.",
+            "Paperclip-specific MCP tools are available under the `mcp__paperclip__*` namespace for Linear, market data, research, and any other plugin in the host. Use them when the user asks about agents, tasks, projects, tickets, market data, or research. Otherwise behave exactly as you would in a normal Claude Code session — read/edit files, run shell commands, search the web, etc.",
+            pluginToolCatalog,
           ]
             .filter(Boolean)
             .join("\n");
