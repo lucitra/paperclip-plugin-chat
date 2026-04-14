@@ -13,6 +13,18 @@ export interface ChatThread {
   createdBy: string | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Thread-scoped "approve always" rules in Claude Code's permission
+   * format (e.g. `Bash(ls *)`, `Write`, `mcp__paperclip__paperclip-create-issue`).
+   * Appended when the board approves a tool call with a "remember" hint
+   * in the decisionNote. Checked in canUseTool before creating new
+   * approval requests.
+   */
+  allowedTools?: string[];
+  /** Workspace cwd this thread is scoped to (set from host context, overrideable per-message). */
+  workspaceCwd?: string | null;
+  /** Human-readable workspace label for display. */
+  workspaceLabel?: string | null;
 }
 
 /** A single chat message */
@@ -54,7 +66,8 @@ export interface ChatStreamEvent {
     | "result"
     | "error"
     | "title_updated"
-    | "done";
+    | "done"
+    | "permission_request";
   text?: string;
   name?: string;
   input?: unknown;
@@ -65,4 +78,8 @@ export interface ChatStreamEvent {
   usage?: { input_tokens: number; output_tokens: number };
   costUsd?: number;
   title?: string;
+  /** Board-approval request — `approvalId` identifies the pending record */
+  approvalId?: string;
+  /** Whether the error is retryable (transient network/rate-limit vs permanent). */
+  retryable?: boolean;
 }

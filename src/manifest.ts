@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 export const PLUGIN_ID = "paperclip-chat";
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.6.1";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -16,13 +16,12 @@ const manifest: PaperclipPluginManifestV1 = {
     // UI
     "ui.page.register",
     "ui.sidebar.register",
-    // Agent sessions (streaming chat)
-    "agent.sessions.create",
-    "agent.sessions.list",
-    "agent.sessions.send",
-    "agent.sessions.close",
-    // Read agents for adapter/model discovery
+    // Read agents for adapter/model discovery + JWT minting
     "agents.read",
+    // Read issues, projects, companies for richer context
+    "issues.read",
+    "projects.read",
+    "companies.read",
     // Plugin state for thread/message persistence
     "plugin.state.read",
     "plugin.state.write",
@@ -62,7 +61,7 @@ const manifest: PaperclipPluginManifestV1 = {
       placementZone: "sidebar",
       action: {
         type: "navigate",
-        target: "plugins/paperclip-chat",
+        target: "/plugins/paperclip-chat",
       },
     },
   ],

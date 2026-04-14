@@ -1,6 +1,6 @@
 {
-  "name": "@paperclipai/plugin-chat",
-  "version": "0.1.0",
+  "name": "@lucitra/paperclip-plugin-chat",
+  "version": "0.6.1",
   "description": "Multi-adapter AI chat plugin for Paperclip — supports Claude, Codex, and OpenCode",
   "type": "module",
   "exports": {
@@ -14,10 +14,15 @@
   "scripts": {
     "build": "tsc && node ./scripts/build-ui.mjs",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config ./vitest.config.ts"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "^1.0.0"
+    "@anthropic-ai/claude-agent-sdk": "^0.1.15",
+    "@lucitra/mcp-paperclip": "file:../paperclip/packages/mcp-paperclip",
+    "@paperclipai/plugin-sdk": "2026.331.0-canary.4",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",
@@ -26,7 +31,8 @@
     "esbuild": "^0.27.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "3.2.4"
   },
   "peerDependencies": {
     "react": ">=18"
