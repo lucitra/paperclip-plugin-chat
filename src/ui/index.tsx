@@ -1063,6 +1063,72 @@ export function ChatPage(_props: PluginPageProps) {
       return null;
     }
   });
+
+  // ?agent=<id> query param — set selectedAdapter to the agent's adapter type.
+  // The agent bar uses this to route chat to a specific agent's model.
+  const [initialAgentId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const p = new URLSearchParams(window.location.search);
+      return p.get("agent");
+    } catch {
+      return null;
+    }
+  });
+
+  // Open tabs — thread IDs shown as tabs above messages. Persisted to localStorage
+  // per company so tabs survive refresh. Most-recently-used stays rightmost.
+  const tabsStorageKey = companyId ? `paperclip-chat.openTabs:${companyId}` : null;
+  const [openTabs, setOpenTabs] = useState<string[]>(() => {
+    if (!tabsStorageKey) return [];
+    try {
+      const raw = localStorage.getItem(tabsStorageKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Persist openTabs
+  useEffect(() => {
+    if (!tabsStorageKey) return;
+    try {
+      localStorage.setItem(tabsStorageKey, JSON.stringify(openTabs));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [openTabs, tabsStorageKey]);
+
+  // When a thread is selected, add to openTabs (if not already) and cap at 8.
+  useEffect(() => {
+    if (!selectedThreadId) return;
+    setOpenTabs((prev) => {
+      if (prev.includes(selectedThreadId)) return prev;
+      const next = [...prev, selectedThreadId];
+      // Cap at 8 tabs — evict oldest (leftmost) that isn't currently selected
+      while (next.length > 8) {
+        const toEvict = next.findIndex((id) => id !== selectedThreadId);
+        if (toEvict < 0) break;
+        next.splice(toEvict, 1);
+      }
+      return next;
+    });
+  }, [selectedThreadId]);
+
+  const closeTab = useCallback((threadId: string) => {
+    setOpenTabs((prev) => {
+      const next = prev.filter((id) => id !== threadId);
+      // If we're closing the active tab, switch to the adjacent tab (or null)
+      if (threadId === selectedThreadId) {
+        const wasIndex = prev.indexOf(threadId);
+        const fallback = next[wasIndex] ?? next[wasIndex - 1] ?? null;
+        setSelectedThreadId(fallback);
+      }
+      return next;
+    });
+  }, [selectedThreadId]);
   const [selectedAdapter, setSelectedAdapter] = useState("claude_local");
   const [selectedModel, setSelectedModel] = useState("");
   const [input, setInput] = useState("");
@@ -1170,6 +1236,13 @@ export function ChatPage(_props: PluginPageProps) {
     threadId: selectedThreadId,
   });
   const { data: adapters } = usePluginData<ChatAdapterInfo[]>("adapters", { companyId });
+  const { data: agentsData } = usePluginData<Array<{
+    id: string;
+    name: string;
+    adapterType: string;
+    status: string;
+    icon: string | null;
+  }>>("agents", { companyId });
   const createThread = usePluginAction("createThread");
   const deleteThread = usePluginAction("deleteThread");
   const sendMessage = usePluginAction("sendMessage");
@@ -1345,6 +1418,22 @@ export function ChatPage(_props: PluginPageProps) {
     }
   }, [selectedThread]);
 
+  // Resolve ?agent=<id> query param to adapterType once agents data arrives.
+  // When launched from the Agent Bar, this ensures the next thread uses the
+  // chosen agent's adapter. We don't auto-create a thread — the user's first
+  // message creates it with the correct adapter already selected.
+  const agentParamApplied = useRef(false);
+  useEffect(() => {
+    if (agentParamApplied.current) return;
+    if (!initialAgentId) return;
+    if (!agentsData || agentsData.length === 0) return;
+    const match = agentsData.find((a) => a.id === initialAgentId);
+    if (match) {
+      setSelectedAdapter(match.adapterType);
+      agentParamApplied.current = true;
+    }
+  }, [initialAgentId, agentsData]);
+
   // Default model
   useEffect(() => {
     if (currentModels.length > 0 && !currentModels.find((m) => m.id === selectedModel)) {
@@ -1385,6 +1474,7 @@ export function ChatPage(_props: PluginPageProps) {
   const handleDeleteThread = useCallback(async (threadId: string) => {
     await deleteThread({ threadId, companyId });
     if (selectedThreadId === threadId) setSelectedThreadId(null);
+    setOpenTabs((prev) => prev.filter((id) => id !== threadId));
     refreshThreads();
   }, [companyId, deleteThread, selectedThreadId, refreshThreads]);
 
@@ -1690,6 +1780,48 @@ export function ChatPage(_props: PluginPageProps) {
             </button>
           </div>
         </div>
+
+        {/* ── Tab bar (open threads) ── */}
+        {openTabs.length > 0 && (
+          <div className="flex items-stretch border-b border-border overflow-x-auto shrink-0">
+            {openTabs.map((tabId) => {
+              const tab = threads?.find((t) => t.id === tabId);
+              const isActive = tabId === selectedThreadId;
+              const title = tab?.title || "New Chat";
+              return (
+                <div
+                  key={tabId}
+                  className={`flex items-center gap-1.5 pl-3 pr-1 py-1.5 border-r border-border cursor-pointer transition-colors shrink-0 max-w-[200px] ${
+                    isActive ? "bg-background text-foreground" : "bg-card/50 text-muted-foreground hover:bg-accent/40"
+                  }`}
+                  onClick={() => setSelectedThreadId(tabId)}
+                >
+                  {tab?.status === "running" && (
+                    <span className="chat-tool-pulse inline-block w-1.5 h-1.5 rounded-full bg-[#22c55e] shrink-0" />
+                  )}
+                  <span className="text-[12px] truncate">{title}</span>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(tabId);
+                    }}
+                    className="bg-transparent border-none cursor-pointer p-0.5 rounded opacity-40 hover:opacity-100 hover:bg-accent/60 text-muted-foreground shrink-0"
+                    title="Close tab"
+                  >
+                    <span className="text-[13px] leading-none">&times;</span>
+                  </button>
+                </div>
+              );
+            })}
+            <button
+              onClick={() => { setSelectedThreadId(null); setInput(""); }}
+              className="flex items-center justify-center px-2 py-1.5 cursor-pointer text-muted-foreground/60 hover:text-foreground hover:bg-accent/40 bg-transparent border-none shrink-0"
+              title="New tab"
+            >
+              <IconPlus size={13} />
+            </button>
+          </div>
+        )}
 
         {/* ── Messages area ── */}
         <div className="chat-scroll flex-1 overflow-auto px-8 relative">

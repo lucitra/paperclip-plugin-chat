@@ -260,6 +260,24 @@ const plugin = definePlugin({
       },
     );
 
+    // ── Data: list agents for adapter resolution (used by ?agent=<id> param) ──
+    ctx.data.register("agents", async (params: Record<string, unknown>) => {
+      const companyId = params.companyId as string;
+      if (!companyId) return [];
+      try {
+        const agents = await ctx.agents.list({ companyId });
+        return agents.map((a) => ({
+          id: a.id,
+          name: a.name,
+          adapterType: a.adapterType,
+          status: a.status,
+          icon: a.icon,
+        }));
+      } catch {
+        return [];
+      }
+    });
+
     // ── Data: list available adapters ───────────────────────────────
     ctx.data.register("adapters", async (params: Record<string, unknown>) => {
       const companyId = params.companyId as string;
